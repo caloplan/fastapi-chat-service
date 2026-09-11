@@ -1,0 +1,25 @@
+services:
+  chat-service:
+    build: .
+    container_name: chat-service
+    ports:
+      - "9095:9095"
+    environment:
+      - APP_ENV=production
+      # user-service 对接：Docker 同网络内用服务名 user-service；若 user-service 在外部则改实际地址
+      - USER_SERVICE_URL=http://user-service:8000
+      - JWKS_CACHE_TTL_SECONDS=3600
+      # superuser 三重 AND 校验：role=superuser + username 匹配 + user_id 匹配，缺一不可
+      # 部署时请将 SUPERUSER_USER_IDS 改为 user-service 中实际 superuser 的 ID
+      - SUPERUSER_USERNAMES=["superuser"]
+      - SUPERUSER_USER_IDS=[1]
+      - LOG_LEVEL=INFO
+    volumes:
+      # 仅日志持久化（无数据库存储）
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9095/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
