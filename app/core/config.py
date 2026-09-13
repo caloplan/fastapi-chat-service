@@ -38,6 +38,31 @@ class Settings(BaseSettings):
     SUPERUSER_USERNAMES: List[str] = ["superuser"]
     SUPERUSER_USER_IDS: List[int] = [1]
 
+    # 服务名白名单：非 superuser 的请求必须携带 service_name 且命中本白名单，否则 403
+    # （superuser 不受此限制，见 app/core/dependencies.py）
+    ALLOWED_SERVICE_NAMES: List[str] = ["default"]
+
+    # Redis（redis.asyncio，用于缓存 / 中间件 / 会话等）
+    # 外部 Redis：直接配置提供方给出的连接 URL（云 Redis / 自建实例均可），不在 Docker 内置镜像
+    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_PREFIX: str = "chat_service"
+    REDIS_DECODE_RESPONSES: bool = True
+
+    # PydanticAI（AI Agent 基础框架）
+    # AI_PROVIDER：deepseek=DeepSeek 官方端点（api.deepseek.com，无需 AI_BASE_URL）；
+    #              openai=任意 OpenAI 兼容接口（base_url 指向自建网关/代理时用）
+    # AI_API_KEY 为空时回退 OPENAI_API_KEY（deepseek 模式）或 DEEPSEEK_API_KEY 环境变量
+    AI_PROVIDER: str = "deepseek"
+    AI_MODEL_NAME: str = "deepseek-chat"
+    AI_API_KEY: str = ""
+    AI_BASE_URL: str = ""
+    AI_SYSTEM_PROMPT: str = "你是 Chat Service 的智能助手，请用简洁中文回答用户问题。"
+    AI_REQUEST_TIMEOUT_SECONDS: float = 60.0
+
+    # Tool 配置基础设施：AI_ENABLED_TOOLS 控制注入 Agent 的 tool 名单
+    # - ["*"] 启用全部已注册 tool（默认）；["name_a", "name_b"] 仅启用名单内；[] 全部禁用
+    AI_ENABLED_TOOLS: List[str] = ["*"]
+
     # 日志
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "logs/chat_service.log"
@@ -58,7 +83,15 @@ class Settings(BaseSettings):
         "message_read",
     ]
 
-    @field_validator("ALLOWED_ORIGINS", "LOG_OPERATIONS", "SUPERUSER_USERNAMES", "SUPERUSER_USER_IDS", mode="before")
+    @field_validator(
+        "ALLOWED_ORIGINS",
+        "LOG_OPERATIONS",
+        "SUPERUSER_USERNAMES",
+        "SUPERUSER_USER_IDS",
+        "ALLOWED_SERVICE_NAMES",
+        "AI_ENABLED_TOOLS",
+        mode="before",
+    )
     @classmethod
     def _parse_list(cls, v):
         """支持从 .env 读取 JSON 数组字符串。"""

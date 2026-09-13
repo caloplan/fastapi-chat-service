@@ -8,8 +8,12 @@ pydantic-settings>=2.2.0
 # 安全（JWT 校验，消费 user-service 令牌）
 python-jose[cryptography]>=3.3.0
 cryptography>=42.0.0
-# HTTP 客户端（拉取 user-service JWKS）
+# HTTP 客户端（拉取 user-service JWKS / AI 调用）
 httpx>=0.27.0
+# 缓存 / 中间件（Redis，redis.asyncio）
+redis>=5.0
+# AI Agent 框架（PydanticAI，OpenAI 兼容接口）
+pydantic-ai>=1.0
 # 说明
 # - 无数据库存储：不含 SQLAlchemy / aiosqlite / alembic
 # - 本服务不签发令牌、不存用户表，无需 passlib/bcrypt

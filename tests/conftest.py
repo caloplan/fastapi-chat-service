@@ -22,6 +22,14 @@ os.environ["ALGORITHM"] = "RS256"
 # 测试 superuser 使用 user_id=999, username=superuser, role=superuser（三重 AND 校验）
 os.environ["SUPERUSER_USERNAMES"] = '["superuser"]'
 os.environ["SUPERUSER_USER_IDS"] = "[999]"
+# 服务名白名单：非 superuser 请求必须命中，否则 403（白名单相关用例单独用 forum 等未命中名）
+os.environ["ALLOWED_SERVICE_NAMES"] = '["default", "chat"]'
+# Redis / AI 配置（测试中依赖注入 mock，不发起真实连接/调用）
+os.environ["REDIS_URL"] = "redis://localhost:6379/15"
+os.environ["AI_PROVIDER"] = "deepseek"
+os.environ["AI_MODEL_NAME"] = "deepseek-chat"
+os.environ["AI_API_KEY"] = "test-key"
+os.environ["AI_ENABLED_TOOLS"] = '["*"]'
 
 from app.main import app  # noqa: E402
 

@@ -22,7 +22,12 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 async def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
 ) -> CurrentUser:
-    """从 JWT 解析当前用户信息（user-service 签发）。"""
+    """从 JWT 解析当前用户信息（user-service 签发）。
+
+    认证成功后额外执行服务名白名单校验：
+    - superuser（三重 AND 判定通过）直接放行；
+    - 其余用户要求 JWT 中的 service_name 命中 ALLOWED_SERVICE_NAMES，否则 403。
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="无法验证凭据",
@@ -42,13 +47,22 @@ async def get_current_user(
     except Exception:
         raise credentials_exception
 
-    return CurrentUser(
+    user = CurrentUser(
         sub=payload.get("sub", ""),
         user_id=user_id,
         service_name=payload.get("service_name", "default"),
         role=payload.get("role", "user"),
         type=payload.get("type", "access"),
     )
+
+    # 服务名白名单：非 superuser 必须命中 ALLOWED_SERVICE_NAMES
+    if not is_superuser(user) and user.service_name not in settings.ALLOWED_SERVICE_NAMES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"服务 {user.service_name} 不在访问白名单中",
+        )
+
+    return user
 
 
 def is_superuser(user: CurrentUser) -> bool:

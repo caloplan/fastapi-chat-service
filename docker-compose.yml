@@ -13,9 +13,18 @@ services:
       # 部署时请将 SUPERUSER_USER_IDS 改为 user-service 中实际 superuser 的 ID
       - SUPERUSER_USERNAMES=["superuser"]
       - SUPERUSER_USER_IDS=[1]
+      # 服务名白名单：非 superuser 请求必须命中，否则 403
+      - ALLOWED_SERVICE_NAMES=["default"]
+      # Redis 为外部接入：填 Redis 提供方给出的连接 URL（云 Redis / 自建实例均可）
+      - REDIS_URL=redis://localhost:6379/0
+      # PydanticAI：DeepSeek 官方端点（api.deepseek.com），填实际 DeepSeek API Key
+      - AI_PROVIDER=deepseek
+      - AI_MODEL_NAME=deepseek-chat
+      - AI_API_KEY=
+      # AI_ENABLED_TOOLS=["*"] 启用全部注册 tool；可改为具体名单，[] 全部禁用
+      - AI_ENABLED_TOOLS=["*"]
       - LOG_LEVEL=INFO
     volumes:
-      # 仅日志持久化（无数据库存储）
       - ./logs:/app/logs
     restart: unless-stopped
     healthcheck:

@@ -4,6 +4,7 @@
 - 公开端点（/health、/）正常响应；
 - get_current_user：有效 access token 解析正确；无 token / 伪造 / 过期 / refresh token /
   未知 kid / 缺 user_id → 401（HTTPException）；
+- 服务名白名单：非 superuser 的 service_name 未命中 ALLOWED_SERVICE_NAMES → 403；superuser 豁免；
 - is_superuser / require_superuser：三重 AND 权限判定（role + 用户名白名单 + user_id 白名单）。
 """
 
@@ -39,14 +40,14 @@ async def test_get_current_user_valid():
     token = create_test_token(
         user_id=42,
         username="alice",
-        service_name="forum",
+        service_name="default",  # 命中 ALLOWED_SERVICE_NAMES=["default", "chat"]
         role="user",
     )
     user = await get_current_user(token)
     assert isinstance(user, CurrentUser)
     assert user.user_id == 42
     assert user.sub == "alice"
-    assert user.service_name == "forum"
+    assert user.service_name == "default"
     assert user.role == "user"
     assert user.type == "access"
 
@@ -95,6 +96,47 @@ async def test_get_current_user_missing_user_id():
     }
     token = jose_jwt.encode(payload, _TEST_PRIVATE_PEM, algorithm="RS256", headers={"kid": "test-kid-001"})
     await _assert_unauthorized(token)
+
+
+# ── 服务名白名单（非 superuser 必须命中 ALLOWED_SERVICE_NAMES）──
+
+async def test_get_current_user_disallowed_service_forbidden():
+    """非 superuser 且 service_name 未命中白名单 → 403。"""
+    token = create_test_token(
+        user_id=42,
+        username="alice",
+        service_name="forum",  # 不在 ALLOWED_SERVICE_NAMES=["default", "chat"]
+        role="user",
+    )
+    with pytest.raises(HTTPException) as exc:
+        await get_current_user(token)
+    assert exc.value.status_code == 403
+
+
+async def test_get_current_user_disallowed_service_superuser_bypass():
+    """superuser（三重 AND 通过）不受服务名白名单限制。"""
+    token = create_test_token(
+        user_id=999,
+        username="superuser",
+        service_name="forum",  # 未命中白名单但 superuser 豁免
+        role="superuser",
+    )
+    user = await get_current_user(token)
+    assert user.role == "superuser"
+    assert is_superuser(user) is True
+
+
+async def test_get_current_user_superuser_like_role_requires_service_match():
+    """role=superuser 但三重 AND 未全中（如 user_id 不在白名单）→ 按非 superuser 处理，仍需命中服务名白名单。"""
+    token = create_test_token(
+        user_id=42,  # 不在 SUPERUSER_USER_IDS=[999]
+        username="superuser",
+        service_name="forum",
+        role="superuser",
+    )
+    with pytest.raises(HTTPException) as exc:
+        await get_current_user(token)
+    assert exc.value.status_code == 403
 
 
 # ── is_superuser：三重 AND 判定 ───────────────────────────
