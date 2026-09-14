@@ -57,7 +57,37 @@ user-service 签发 JWT 的协议：
 - `app/ai/tools/`：注册 → 发现 → 按配置过滤 → 注入 Agent 的完整链路；
 - **新增 Tool**：在 `app/ai/tools/` 新建模块，用 `@register_tool(name=..., description=...)` 装饰 async 函数即可，`build_tools()` 自动发现；
 - **配置开关**：`AI_ENABLED_TOOLS=["*"]` 启用全部（默认）；`["name_a","name_b"]` 仅启用名单内；`[]` 全部禁用；
-- 内置演示 Tool：`get_current_time`（当前时间）、`add_numbers`（整数加法）。
+- **需审批 Tool**：`@register_tool(..., requires_approval=True)` 标记，模型调用前需用户确认（见下方审批流）；
+- 内置演示 Tool：`get_current_time`（当前时间）、`add_numbers`（整数加法）、`deploy_service`（部署服务，需审批）。
+
+## 需审批 Tool 的 taskid 审批流
+
+对应 pydantic-ai 的 `requires_approval` 机制（Agent 自动切换 `output_type=str | DeferredToolRequests`）：
+
+```
+客户端                    服务端                        Redis
+   │  POST /ai/chat          │                            │
+   │────────────────────────>│ agent.run(prompt)          │
+   │                         │ 命中需审批 tool            │
+   │                         │ → 生成 taskid              │
+   │                         │───────────────────────────>│ SET approval:{taskid}
+   │                         │                            │   = {消息快照, 待审批调用}
+   │                         │                            │   EXPIRE AI_APPROVAL_TTL_SECONDS
+   │<─ need_approval=true ───│                            │
+   │  taskid + pending_tools │                            │
+   │                         │                            │
+   │  用户确认后             │                            │
+   │  POST /ai/approval      │                            │
+   │  {taskid, approved}     │                            │
+   │────────────────────────>│ 校验归属 → 取快照 → 续跑    │
+   │                         │───────────────────────────>│ DEL approval:{taskid}（消费）
+   │<──── 最终回复 / 拒绝 ────│                            │
+```
+
+- **taskid 存 Redis**：`{REDIS_PREFIX}:approval:{taskid}`，TTL=`AI_APPROVAL_TTL_SECONDS`（默认 300s=5min），含发起者 `user_id`（越权执行 → 403）与消息快照；
+- **消费**：Redis Lua 脚本**原子完成"存在性检查 + 创建者 user_id 校验 + 删除"**，批准/拒绝处理完成后立即消费；并发/重复提交同一 taskid 只执行一次（再次提交 → 410）；超时未处理由 TTL 自动作废；
+- **批准**（`approved=true`）→ tool 执行，响应回传 `tool_results` 明细；**拒绝**（`approved=false`）→ tool 不执行，模型照常给出最终回复；
+- 方案 A 语义：常态下服务端零内容留存（客户端持有全量历史）；仅待审批瞬间暂存消息快照于 Redis 内存，TTL 即焚。
 
 ## 项目结构
 
@@ -71,10 +101,21 @@ fastapi-chat-service/
 │   │   ├── dependencies.py              # 认证依赖（get_current_user / require_superuser / 服务名白名单）
 │   │   └── redis.py                     # Redis 连接生命周期 + get_redis 依赖
 │   ├── ai/
-│   │   ├── agent.py                     # PydanticAI Agent 构建 + get_ai_agent 依赖
+│   │   ├── agent.py                     # PydanticAI Agent 构建（审批输出类型自动切换）+ get_ai_agent
+│   │   ├── service.py                   # AI 编排：run_chat / resolve_approval（taskid 审批流）
 │   │   └── tools/                       # Tool 注册/配置基础设施
-│   │       ├── __init__.py              # register_tool / build_tools / AI_ENABLED_TOOLS 过滤
-│   │       └── basic.py                 # 演示 Tool（get_current_time / add_numbers）
+│   │       ├── __init__.py              # register_tool(requires_approval) / build_tools / AI_ENABLED_TOOLS 过滤
+│   │       └── basic.py                 # 演示 Tool（get_current_time / add_numbers / deploy_service(需审批)）
+│   ├── schemas/
+│   │   ├── auth.py                      # CurrentUser（JWT payload 解析）
+│   │   └── ai/                          # AI Schema 包（chat / model / approval / error）
+│   │       ├── __init__.py              # 统一导出
+│   │       ├── chat.py                  # 消息 / 请求 / 响应（含审批分支）
+│   │       ├── model.py                 # 推理参数 / Token 用量
+│   │       ├── approval.py              # 审批决定请求/响应
+│   │       └── error.py                 # 统一错误结构
+│   ├── routes/
+│   │   └── infra.py                     # 基础设施路由（Redis ping / AI chat / AI approval）
 │   ├── schemas/
 │   │   ├── auth.py                      # CurrentUser（JWT payload 解析）
 │   │   └── ai.py                        # AI 演示请求/响应 Schema
@@ -134,7 +175,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 9095
 | GET | `/health` | 健康检查 | 否 |
 | GET | `/` | 服务信息 | 否 |
 | GET | `/api/v1/redis/ping` | Redis 连通性检查（基础框架演示） | 是（Bearer JWT） |
-| POST | `/api/v1/ai/chat` | PydanticAI Agent 演示（body: `{"message": "..."}`） | 是（Bearer JWT） |
+| POST | `/api/v1/ai/chat` | AI 对话（body: `{"message": "...", "history": [...]}`；可触发需审批 Tool） | 是（Bearer JWT） |
+| POST | `/api/v1/ai/approval` | 审批决定（body: `{"taskid": "...", "approved": true/false}`） | 是（Bearer JWT） |
 
 > 受保护端点均要求 Bearer Token：user-service 签发的 access token，且非 superuser 的 `service_name` 必须命中 `ALLOWED_SERVICE_NAMES`。
 
@@ -152,7 +194,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 9095
 pytest tests -v
 ```
 
-测试覆盖：health / 服务信息端点；`get_current_user` 有效令牌解析、无 token / 伪造 / 过期 / refresh token / 未知 kid / 缺 user_id → 401；服务名白名单（非 superuser 未命中 → 403，superuser 豁免）；superuser 三重 AND 权限判定；Redis / PydanticAI 演示端点（依赖注入 mock）；Tool 注册与 `AI_ENABLED_TOOLS` 配置过滤。
+测试覆盖：health / 服务信息端点；`get_current_user` 有效令牌解析、无 token / 伪造 / 过期 / refresh token / 未知 kid / 缺 user_id → 401；服务名白名单（非 superuser 未命中 → 403，superuser 豁免）；superuser 三重 AND 权限判定；Redis / PydanticAI 演示端点（mock）；Tool 注册与 `AI_ENABLED_TOOLS` 配置过滤；**审批流全链路**（触发 → taskid 暂存 → 批准执行/拒绝 → 消费，过期 410 / 越权 403）。
 
 ## Docker 部署
 
@@ -170,6 +212,6 @@ docker-compose up -d --build
 1. **认证**：受保护接口直接注入 `Depends(get_current_user)` 拿当前用户（`CurrentUser`），管理接口注入 `Depends(require_superuser)`；服务名白名单已在 `get_current_user` 内统一校验；
 2. **业务路由**：在 `app/routes/` 下新建路由模块并挂载到 `main.py`，写入时从 `CurrentUser` 提取 `user_id` / `service_name` 做归属与越权判定（403）；
 3. **Redis 使用**：注入 `get_redis` 依赖做缓存 / 限流 / 会话，Key 统一加 `REDIS_PREFIX` 前缀；
-4. **AI 能力**：注入 `get_ai_agent` 依赖做对话；需要模型工具时在 `app/ai/tools/` 下新增模块并用 `@register_tool` 注册，`AI_ENABLED_TOOLS` 控制启用名单；
+4. **AI 能力**：注入 `get_ai_agent` 依赖做对话；需要模型工具时在 `app/ai/tools/` 下新增模块并用 `@register_tool` 注册（需用户确认的加 `requires_approval=True`），`AI_ENABLED_TOOLS` 控制启用名单，审批流开箱即用；
 5. **持久化（按需引入）**：若后续需要存储会话/消息，再引入 SQLAlchemy 异步 + SQLite（参照 `mservice-fastapi-user` 的 `core/database.py` 与分层结构）；
 6. **操作日志**：Repository 层用 `LogProxy(Repository(db))` 包裹自动脱敏记录。

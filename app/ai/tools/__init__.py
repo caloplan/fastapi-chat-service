@@ -4,14 +4,18 @@
 
     from app.ai.tools import register_tool
 
-    @register_tool(name="get_current_time", description="获取当前日期时间")
-    async def get_current_time() -> str:
+    @register_tool(name="deploy_service", description="部署服务到生产环境", requires_approval=True)
+    async def deploy_service(service_name: str) -> str:
         ...
 
 配置开关（AI_ENABLED_TOOLS，见 app/core/config.py）:
     - ["*"]             启用全部已注册 tool（默认）；
     - ["name_a", ...]   仅启用名单内的 tool；
     - []                全部禁用（Agent 不带任何 tool）。
+
+审批机制（requires_approval=True）:
+    模型想调用该 tool 时不会直接执行，而是返回 need_approval=true 的响应
+    （taskid 暂存 Redis，见 app/ai/service.py），由用户确认后执行/拒绝。
 
 使用::
 
@@ -40,15 +44,29 @@ class ToolDef:
     name: str
     description: str
     func: Callable
+    requires_approval: bool = False
 
 
-def register_tool(name: str, description: str) -> Callable[[Callable], Callable]:
-    """注册装饰器：把（async）函数注册为可用 Tool，返回原函数。"""
+def register_tool(
+    name: str,
+    description: str,
+    *,
+    requires_approval: bool = False,
+) -> Callable[[Callable], Callable]:
+    """注册装饰器：把（async）函数注册为可用 Tool，返回原函数。
+
+    requires_approval=True 时，模型调用该 tool 前需用户确认（taskid 审批流）。
+    """
 
     def decorator(func: Callable) -> Callable:
         if name in _TOOL_REGISTRY:
             raise ValueError(f"Tool 重复注册: {name}")
-        _TOOL_REGISTRY[name] = ToolDef(name=name, description=description, func=func)
+        _TOOL_REGISTRY[name] = ToolDef(
+            name=name,
+            description=description,
+            func=func,
+            requires_approval=requires_approval,
+        )
         return func
 
     return decorator
@@ -81,13 +99,36 @@ def enabled_tool_names() -> list[str]:
     return [name for name in conf if name in registered_tools()]
 
 
+def enabled_tool_defs() -> list[ToolDef]:
+    """按配置返回启用的 ToolDef 列表。"""
+    registry = registered_tools()
+    return [registry[name] for name in enabled_tool_names()]
+
+
+def has_approval_tools() -> bool:
+    """启用的 tool 中是否存在需审批（requires_approval=True）的 tool。"""
+    return any(d.requires_approval for d in enabled_tool_defs())
+
+
 def build_tools() -> list[Tool]:
     """根据配置构建 PydanticAI Tool 列表（供 Agent 构造注入）。"""
-    registry = registered_tools()
     return [
-        Tool(registry[name].func, name=name, description=registry[name].description)
-        for name in enabled_tool_names()
+        Tool(
+            d.func,
+            name=d.name,
+            description=d.description,
+            requires_approval=d.requires_approval,
+        )
+        for d in enabled_tool_defs()
     ]
 
 
-__all__ = ["ToolDef", "build_tools", "enabled_tool_names", "register_tool", "registered_tools"]
+__all__ = [
+    "ToolDef",
+    "build_tools",
+    "enabled_tool_defs",
+    "enabled_tool_names",
+    "has_approval_tools",
+    "register_tool",
+    "registered_tools",
+]

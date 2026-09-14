@@ -14,14 +14,15 @@ build_agent() 构造时自动注入。
 
 import os
 from functools import lru_cache
+from typing import Any
 
 from fastapi import HTTPException, status
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from app.ai.tools import build_tools
+from app.ai.tools import build_tools, has_approval_tools
 from app.core.config import settings
 from app.utils.logger import get_logger
 
@@ -57,20 +58,29 @@ def _build_provider():
 
 
 def build_agent() -> Agent:
-    """根据 settings 构建 PydanticAI Agent（含按配置启用的 tools）。"""
+    """根据 settings 构建 PydanticAI Agent（含按配置启用的 tools）。
+
+    启用工具中存在 requires_approval=True 时，输出类型切换为
+    str | DeferredToolRequests，使需审批的工具调用以审批请求返回而非直接执行。
+    """
     provider = _build_provider()
     model = OpenAIChatModel(model_name=settings.AI_MODEL_NAME, provider=provider)
     tools = build_tools()
+    output_type: Any = str
+    if has_approval_tools():
+        output_type = str | DeferredToolRequests
     agent = Agent(
         model=model,
         system_prompt=settings.AI_SYSTEM_PROMPT,
         tools=tools,
+        output_type=output_type,
     )
     logger.info(
-        "PydanticAI Agent 已构建: provider=%s model=%s tools=%s",
+        "PydanticAI Agent 已构建: provider=%s model=%s tools=%s approval=%s",
         settings.AI_PROVIDER,
         settings.AI_MODEL_NAME,
         [t.name for t in tools],
+        has_approval_tools(),
     )
     return agent
 

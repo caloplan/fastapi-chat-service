@@ -6,7 +6,6 @@
 
 from types import SimpleNamespace
 
-from app.ai.agent import get_ai_agent
 from app.core.redis import get_redis
 from app.main import app
 from tests.conftest import create_test_token
@@ -25,13 +24,21 @@ class _FakeRedis:
 
 
 class _FakeAgent:
-    """模拟 PydanticAI Agent（run 返回带 output 的结果）。"""
+    """模拟 PydanticAI Agent（run 返回带 output/usage/all_messages 的结果）。"""
 
     def __init__(self, output: str = "你好，我是 Chat Service 助手。") -> None:
         self._output = output
 
-    async def run(self, message: str) -> SimpleNamespace:
-        return SimpleNamespace(output=self._output)
+    @staticmethod
+    def _usage() -> SimpleNamespace:
+        return SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15)
+
+    async def run(self, message: str, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            output=self._output,
+            usage=self._usage,
+            all_messages=lambda: [],
+        )
 
 
 def _auth_headers(**overrides: object) -> dict[str, str]:
@@ -79,16 +86,13 @@ async def test_redis_ping_disallowed_service_forbidden(client):
 
 # ── PydanticAI 演示端点 ─────────────────────────────────────
 
-async def test_ai_chat_ok(client):
-    app.dependency_overrides[get_ai_agent] = lambda: _FakeAgent(output="这是测试回复")
-    try:
-        resp = await client.post(
-            "/api/v1/ai/chat",
-            headers=_auth_headers(service_name="default"),
-            json={"message": "你好"},
-        )
-    finally:
-        app.dependency_overrides.pop(get_ai_agent, None)
+async def test_ai_chat_ok(client, monkeypatch):
+    monkeypatch.setattr("app.ai.service.get_ai_agent", lambda: _FakeAgent(output="这是测试回复"))
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={"message": "你好"},
+    )
     assert resp.status_code == 200
     data = resp.json()
     assert data["reply"] == "这是测试回复"

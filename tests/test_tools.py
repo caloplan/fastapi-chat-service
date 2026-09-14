@@ -45,7 +45,7 @@ def test_enabled_all_by_default():
         names = enabled_tool_names()
     finally:
         settings.AI_ENABLED_TOOLS = original
-    assert set(names) == {"get_current_time", "add_numbers"}
+    assert set(names) == {"get_current_time", "add_numbers", "deploy_service"}
 
 
 def test_enabled_filtered_list():

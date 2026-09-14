@@ -1,7 +1,7 @@
-"""基础设施演示路由：Redis 连通性、PydanticAI Agent 演示。
+"""基础设施演示路由：Redis 连通性、PydanticAI 对话与审批流。
 
-这些端点用于验证基础框架接入，均要求认证（get_current_user 会同步执行
-service_name 白名单校验，superuser 除外）。
+所有端点均要求认证（get_current_user 会同步执行 service_name
+白名单校验，superuser 除外）。
 """
 
 import time
@@ -9,13 +9,11 @@ from typing import Annotated
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic_ai import Agent
 
-from app.ai.agent import get_ai_agent
-from app.core.config import settings
+from app.ai.service import resolve_approval, run_chat
 from app.core.dependencies import get_current_user
 from app.core.redis import get_redis
-from app.schemas.ai import ChatRequest, ChatResponse
+from app.schemas.ai import ApprovalDecisionRequest, ApprovalDecisionResponse, ChatRequest, ChatResponse
 from app.schemas.auth import CurrentUser
 
 router = APIRouter(prefix="/api/v1", tags=["基础设施"])
@@ -38,17 +36,17 @@ async def redis_ping(
     return {"status": "ok", "latency_ms": elapsed_ms}
 
 
-@router.post("/ai/chat", response_model=ChatResponse, summary="PydanticAI Agent 演示", description="需要认证；验证 PydanticAI 基础框架接入。")
+@router.post("/ai/chat", response_model=ChatResponse, summary="AI 对话（可触发需审批 Tool）", description="需要认证；正常回复或返回 need_approval=true + taskid 审批请求。")
 async def ai_chat(
     body: ChatRequest,
-    _: Annotated[CurrentUser, Depends(get_current_user)],
-    agent: Annotated[Agent, Depends(get_ai_agent)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> ChatResponse:
-    try:
-        result = await agent.run(body.message)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"AI 调用失败: {exc}",
-        )
-    return ChatResponse(reply=str(result.output or ""), model=settings.AI_MODEL_NAME)
+    return await run_chat(current_user, body)
+
+
+@router.post("/ai/approval", response_model=ApprovalDecisionResponse, summary="审批决定：执行/拒绝需审批 Tool", description="需要认证；携带 taskid 提交批准/拒绝，服务端执行后消费 taskid。")
+async def ai_approval(
+    body: ApprovalDecisionRequest,
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> ApprovalDecisionResponse:
+    return await resolve_approval(current_user, body)

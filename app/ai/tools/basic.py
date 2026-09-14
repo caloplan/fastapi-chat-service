@@ -19,3 +19,9 @@ async def get_current_time() -> str:
 async def add_numbers(a: int, b: int) -> int:
     """计算两个整数之和。"""
     return a + b
+
+
+@register_tool(name="deploy_service", description="部署指定服务到生产环境（需要用户确认后执行）", requires_approval=True)
+async def deploy_service(service_name: str) -> str:
+    """部署指定服务到生产环境（示例：需审批 Tool，模型调用后由用户确认才执行）。"""
+    return f"deployed:{service_name}"

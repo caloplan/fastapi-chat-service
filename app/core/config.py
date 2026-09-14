@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     # Tool 配置基础设施：AI_ENABLED_TOOLS 控制注入 Agent 的 tool 名单
     # - ["*"] 启用全部已注册 tool（默认）；["name_a", "name_b"] 仅启用名单内；[] 全部禁用
     AI_ENABLED_TOOLS: List[str] = ["*"]
+    # 需审批 Tool 的 taskid 暂存 TTL（秒）：审批请求在期限内有效，超时自动作废
+    AI_APPROVAL_TTL_SECONDS: int = 300
 
     # 日志
     LOG_LEVEL: str = "INFO"
