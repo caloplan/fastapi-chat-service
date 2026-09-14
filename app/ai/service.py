@@ -19,6 +19,7 @@ from pydantic_ai import DeferredToolRequests, DeferredToolResults, ModelMessages
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
 
 from app.ai.agent import get_ai_agent
+from app.ai.context import bind_ai_context
 from app.core.config import settings
 from app.core.redis import get_redis
 from app.schemas.ai import (
@@ -95,63 +96,68 @@ def _extract_tool_results(messages: Any) -> list[ToolCallResult]:
     return [call for call in calls.values() if call.result is not None]
 
 
-async def run_chat(user: CurrentUser, body: ChatRequest) -> ChatResponse:
-    """执行一次对话：正常回复，或命中需审批 Tool 时返回 taskid 审批请求。"""
-    agent = get_ai_agent()
-    history = build_message_history(body.history)
-    conversation_id = body.conversation_id or uuid.uuid4().hex
+async def run_chat(user: CurrentUser, body: ChatRequest, token: str | None = None) -> ChatResponse:
+    """执行一次对话：正常回复，或命中需审批 Tool 时返回 taskid 审批请求。
 
-    start = time.perf_counter()
-    try:
-        result = await agent.run(body.message, message_history=history)
-    except Exception as exc:
-        logger.error("AI 对话失败: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"AI 调用失败: {exc}",
-        )
-    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+    token：当前请求的原始 JWT（Authorization 头），绑定到 AI 上下文供 tool
+    透传调用 meta-service；审批快照不保存 token（方案 A 零留存）。
+    """
+    with bind_ai_context(token, user):
+        agent = get_ai_agent()
+        history = build_message_history(body.history)
+        conversation_id = body.conversation_id or uuid.uuid4().hex
 
-    output = result.output
-    if isinstance(output, DeferredToolRequests):
-        pending = [
-            PendingToolCall(tool_call_id=p.tool_call_id, name=p.tool_name, arguments=p.args)
-            for p in output.approvals
-        ]
-        taskid = uuid.uuid4().hex
-        snapshot = {
-            "user_id": user.user_id,  # 创建者：审批请求必须由同一用户提交（越权 403）
-            "username": user.sub,  # 审计字段
-            "conversation_id": conversation_id,
-            "message_history": json.loads(ModelMessagesTypeAdapter.dump_json(result.all_messages())),
-            "calls": [p.model_dump() for p in pending],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        redis = await get_redis()
-        await redis.set(
-            _approval_key(taskid),
-            json.dumps(snapshot, ensure_ascii=False),
-            ex=settings.AI_APPROVAL_TTL_SECONDS,
-        )
-        logger.info("需审批 Tool 已暂存: taskid=%s tools=%s ttl=%ss", taskid, [p.name for p in pending], settings.AI_APPROVAL_TTL_SECONDS)
+        start = time.perf_counter()
+        try:
+            result = await agent.run(body.message, message_history=history)
+        except Exception as exc:
+            logger.error("AI 对话失败: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"AI 调用失败: {exc}",
+            )
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+
+        output = result.output
+        if isinstance(output, DeferredToolRequests):
+            pending = [
+                PendingToolCall(tool_call_id=p.tool_call_id, name=p.tool_name, arguments=p.args)
+                for p in output.approvals
+            ]
+            taskid = uuid.uuid4().hex
+            snapshot = {
+                "user_id": user.user_id,  # 创建者：审批请求必须由同一用户提交（越权 403）
+                "username": user.sub,  # 审计字段
+                "conversation_id": conversation_id,
+                "message_history": json.loads(ModelMessagesTypeAdapter.dump_json(result.all_messages())),
+                "calls": [p.model_dump() for p in pending],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            redis = await get_redis()
+            await redis.set(
+                _approval_key(taskid),
+                json.dumps(snapshot, ensure_ascii=False),
+                ex=settings.AI_APPROVAL_TTL_SECONDS,
+            )
+            logger.info("需审批 Tool 已暂存: taskid=%s tools=%s ttl=%ss", taskid, [p.name for p in pending], settings.AI_APPROVAL_TTL_SECONDS)
+            return ChatResponse(
+                conversation_id=conversation_id,
+                model=settings.AI_MODEL_NAME,
+                usage=_usage(result.usage()),
+                latency_ms=latency_ms,
+                need_approval=True,
+                taskid=taskid,
+                pending_tools=pending,
+            )
+
         return ChatResponse(
             conversation_id=conversation_id,
+            reply=str(output or ""),
             model=settings.AI_MODEL_NAME,
             usage=_usage(result.usage()),
             latency_ms=latency_ms,
-            need_approval=True,
-            taskid=taskid,
-            pending_tools=pending,
+            tool_calls=_extract_tool_results(result.all_messages()),
         )
-
-    return ChatResponse(
-        conversation_id=conversation_id,
-        reply=str(output or ""),
-        model=settings.AI_MODEL_NAME,
-        usage=_usage(result.usage()),
-        latency_ms=latency_ms,
-        tool_calls=_extract_tool_results(result.all_messages()),
-    )
 
 
 # Lua 原子消费审批快照：存在性检查 + 创建者(user_id)校验 + 删除一次完成。
@@ -167,53 +173,58 @@ return raw
 """
 
 
-async def resolve_approval(user: CurrentUser, body: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
-    """处理用户对 taskid 的执行决定：批准则执行 tool，拒绝则不执行，随后消费 taskid。"""
-    redis = await get_redis()
-    key = _approval_key(body.taskid)
-    raw = await redis.eval(_CONSUME_APPROVAL_SCRIPT, 1, key, str(user.user_id))
-    if raw == 0:
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="审批任务不存在或已过期",
-        )
-    if raw == -1:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="无权执行该审批任务",
-        )
-    snapshot = json.loads(raw)
+async def resolve_approval(user: CurrentUser, body: ApprovalDecisionRequest, token: str | None = None) -> ApprovalDecisionResponse:
+    """处理用户对 taskid 的执行决定：批准则执行 tool，拒绝则不执行，随后消费 taskid。
 
-    agent = get_ai_agent()
-    messages = ModelMessagesTypeAdapter.validate_json(json.dumps(snapshot["message_history"]))
-    decisions = {call["tool_call_id"]: body.approved for call in snapshot["calls"]}
+    token：当前请求的原始 JWT，续跑期间绑定到 AI 上下文（批准执行的 tool 需要
+    用它调用 meta-service）。审批快照本身不保存 token。
+    """
+    with bind_ai_context(token, user):
+        redis = await get_redis()
+        key = _approval_key(body.taskid)
+        raw = await redis.eval(_CONSUME_APPROVAL_SCRIPT, 1, key, str(user.user_id))
+        if raw == 0:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="审批任务不存在或已过期",
+            )
+        if raw == -1:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无权执行该审批任务",
+            )
+        snapshot = json.loads(raw)
 
-    start = time.perf_counter()
-    try:
-        result = await agent.run(
-            None,
-            message_history=messages,
-            deferred_tool_results=DeferredToolResults(approvals=decisions),
+        agent = get_ai_agent()
+        messages = ModelMessagesTypeAdapter.validate_json(json.dumps(snapshot["message_history"]))
+        decisions = {call["tool_call_id"]: body.approved for call in snapshot["calls"]}
+
+        start = time.perf_counter()
+        try:
+            result = await agent.run(
+                None,
+                message_history=messages,
+                deferred_tool_results=DeferredToolResults(approvals=decisions),
+            )
+        except Exception as exc:
+            logger.error("审批续跑失败: taskid=%s err=%s", body.taskid, exc)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"AI 调用失败: {exc}",
+            )
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+
+        logger.info("审批任务已消费: taskid=%s approved=%s", body.taskid, body.approved)
+
+        return ApprovalDecisionResponse(
+            conversation_id=snapshot.get("conversation_id") or body.taskid,
+            reply=str(result.output or ""),
+            model=settings.AI_MODEL_NAME,
+            usage=_usage(result.usage()),
+            latency_ms=latency_ms,
+            approved=body.approved,
+            tool_results=_extract_tool_results(result.all_messages()),
         )
-    except Exception as exc:
-        logger.error("审批续跑失败: taskid=%s err=%s", body.taskid, exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"AI 调用失败: {exc}",
-        )
-    latency_ms = round((time.perf_counter() - start) * 1000, 2)
-
-    logger.info("审批任务已消费: taskid=%s approved=%s", body.taskid, body.approved)
-
-    return ApprovalDecisionResponse(
-        conversation_id=snapshot.get("conversation_id") or body.taskid,
-        reply=str(result.output or ""),
-        model=settings.AI_MODEL_NAME,
-        usage=_usage(result.usage()),
-        latency_ms=latency_ms,
-        approved=body.approved,
-        tool_results=_extract_tool_results(result.all_messages()),
-    )
 
 
 __all__ = ["build_message_history", "resolve_approval", "run_chat"]

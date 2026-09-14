@@ -23,6 +23,8 @@ services:
       - AI_API_KEY=
       # AI_ENABLED_TOOLS=["*"] 启用全部注册 tool；可改为具体名单，[] 全部禁用
       - AI_ENABLED_TOOLS=["*"]
+      # AI Tool 数据服务对接：meta-service 地址（Docker 同网络内用服务名；外部部署改实际地址）
+      - META_SERVICE_URL=http://meta-service:9093
       - LOG_LEVEL=INFO
     volumes:
       - ./logs:/app/logs

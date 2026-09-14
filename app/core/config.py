@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     AI_SYSTEM_PROMPT: str = "你是 Chat Service 的智能助手，请用简洁中文回答用户问题。"
     AI_REQUEST_TIMEOUT_SECONDS: float = 60.0
 
+    # AI Tool 数据服务对接（caloplan 数据域）
+    # Agent 的 tool 直接 HTTP 调用 meta-service（mservice-fastapi-metastorage）读写 food/meal/body/nutrition，
+    # 复用当前请求 JWT 透传（与 user-service 同一套 RS256 令牌）。Docker 同网络内用服务名 meta-service。
+    META_SERVICE_URL: str = "http://localhost:9093"
+
     # Tool 配置基础设施：AI_ENABLED_TOOLS 控制注入 Agent 的 tool 名单
     # - ["*"] 启用全部已注册 tool（默认）；["name_a", "name_b"] 仅启用名单内；[] 全部禁用
     AI_ENABLED_TOOLS: List[str] = ["*"]

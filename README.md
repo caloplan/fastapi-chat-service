@@ -58,7 +58,25 @@ user-service 签发 JWT 的协议：
 - **新增 Tool**：在 `app/ai/tools/` 新建模块，用 `@register_tool(name=..., description=...)` 装饰 async 函数即可，`build_tools()` 自动发现；
 - **配置开关**：`AI_ENABLED_TOOLS=["*"]` 启用全部（默认）；`["name_a","name_b"]` 仅启用名单内；`[]` 全部禁用；
 - **需审批 Tool**：`@register_tool(..., requires_approval=True)` 标记，模型调用前需用户确认（见下方审批流）；
-- 内置演示 Tool：`get_current_time`（当前时间）、`add_numbers`（整数加法）、`deploy_service`（部署服务，需审批）。
+- **请求上下文**：对话/审批执行期间，当前请求 JWT 与用户身份经 `app/ai/context.py` 的 contextvar 绑定到 AI 上下文，tool 内用 `require_ai_context()` 读取（审批续跑同样绑定，批准执行的 tool 可透传令牌）。
+
+### caloplan 数据域 Tools（本服务定位为 caloplan 专属）
+
+数据服务：**meta-service**（`mservice-fastapi-metastorage`，端口 9093，地址见 `META_SERVICE_URL`），直接 HTTP 调用并**复用当前请求 JWT**（与 user-service 同协议，数据隔离由 meta 侧 Scope 按 token 的 service_name 保证）。
+
+| Tool | 类型 | 说明 |
+|---|---|---|
+| `get_current_time` | 读（免审批） | 当前日期时间 |
+| `list_my_food` | 读（免审批） | 我的食物库（返回 id/名称/每份单位与营养，供 create_meal 引用 food_id） |
+| `list_my_meal` | 读（免审批） | 我的膳食列表 |
+| `get_my_body_by_date` | 读（免审批） | 指定日期身体指标 |
+| `get_my_nutrition_by_date` | 读（免审批） | 指定日期营养目标 |
+| `create_food` | 写（需审批） | 添加食物（entity_key=uuid4 短码，user_id 服务端注入，营养单位服务端补齐） |
+| `create_meal` | 写（需审批） | 添加膳食（模型只传 food_id+份数，**服务端批量查食物构造快照并合计营养**，未找到的 food_id 报错） |
+| `upsert_my_body` | 写（需审批） | 当日身体指标：**每日一条、无则创建、有则仅更新变更字段** |
+| `upsert_my_nutrition` | 写（需审批） | 当日营养目标：同上 |
+
+边界（硬约束）：**用户资料（user-service）AI 永远不允许涉及**；`service_name` 仅作数据访问限制（由 token 决定，不暴露给模型、不可跨服务）。
 
 ## 需审批 Tool 的 taskid 审批流
 
@@ -102,10 +120,17 @@ fastapi-chat-service/
 │   │   └── redis.py                     # Redis 连接生命周期 + get_redis 依赖
 │   ├── ai/
 │   │   ├── agent.py                     # PydanticAI Agent 构建（审批输出类型自动切换）+ get_ai_agent
+│   │   ├── context.py                   # AI 请求上下文（JWT + 用户身份 contextvar 绑定，供 tool 透传）
 │   │   ├── service.py                   # AI 编排：run_chat / resolve_approval（taskid 审批流）
 │   │   └── tools/                       # Tool 注册/配置基础设施
 │   │       ├── __init__.py              # register_tool(requires_approval) / build_tools / AI_ENABLED_TOOLS 过滤
-│   │       └── basic.py                 # 演示 Tool（get_current_time / add_numbers / deploy_service(需审批)）
+│   │       ├── meta_client.py           # meta-service HTTP 客户端（JWT 透传 + 错误映射）
+│   │       ├── _caloplan_common.py      # caloplan 共享（entity_key 生成 / 营养单位 / 日期）
+│   │       ├── basic.py                 # get_current_time（保留的通用 Tool）
+│   │       ├── caloplan_food.py         # create_food / list_my_food
+│   │       ├── caloplan_meal.py         # create_meal / list_my_meal（快照 + 合计营养）
+│   │       ├── caloplan_body.py         # upsert_my_body / get_my_body_by_date
+│   │       └── caloplan_nutrition.py    # upsert_my_nutrition / get_my_nutrition_by_date
 │   ├── schemas/
 │   │   ├── auth.py                      # CurrentUser（JWT payload 解析）
 │   │   └── ai/                          # AI Schema 包（chat / model / approval / error）
@@ -129,7 +154,9 @@ fastapi-chat-service/
 │   ├── conftest.py                      # 测试 RSA 密钥 + JWKS mock + JWT 签发
 │   ├── test_auth.py                     # 认证层单元测试（含服务名白名单）+ health 端点测试
 │   ├── test_infra.py                    # Redis / PydanticAI 演示端点测试
-│   └── test_tools.py                    # Tool 注册/配置过滤测试
+│   ├── test_tools.py                    # Tool 注册/配置过滤测试
+│   ├── test_caloplan_tools.py           # caloplan tools：meta mock、快照/合计营养、upsert、审批标记
+│   └── test_approval.py                 # 审批流全链路（含审批续跑 JWT 透传集成测试）
 ├── .env.example
 ├── requirements.txt / requirements-dev.txt
 ├── pytest.ini
@@ -153,7 +180,8 @@ pip install -r requirements-dev.txt
 
 ```bash
 copy .env.example .env
-# 编辑 .env：USER_SERVICE_URL 指向 user-service 地址；SUPERUSER_USER_IDS 改为实际 superuser ID
+# 编辑 .env：USER_SERVICE_URL 指向 user-service 地址；META_SERVICE_URL 指向 meta-service 地址；
+# SUPERUSER_USER_IDS 改为实际 superuser ID
 ```
 
 ### 3. 启动服务
@@ -188,13 +216,20 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 9095
 - **superuser 白名单**：部署时把 `SUPERUSER_USER_IDS` 改为 user-service 中实际 superuser 的 `user_id`（可在 user-service 的 `/api/v1/users` 列表查询）；
 - **服务名白名单**：部署时把 `ALLOWED_SERVICE_NAMES` 配成允许访问本服务的所有服务名（逗号分隔或 JSON 数组），未命中即 403（superuser 除外）。
 
+## 与 meta-service 对接（caloplan 数据域）
+
+- 本地联调：meta-service 运行在 `http://localhost:9093`（默认，见 `META_SERVICE_URL`）；Docker 部署用同网络服务名 `meta-service`；
+- **JWT 透传**：caloplan tools 直接 HTTP 调用 meta-service，`Authorization` 头复用当前请求的 Bearer token（与 user-service 同一套 RS256 令牌），数据隔离由 meta 侧 Scope 按 token 的 `service_name` + entry 归属保证；
+- **不暴露给模型**：`service_name` / `user_id` / entity_key 均由服务端注入或生成（uuid4 短码），模型不可见、不可改；
+- **审批续跑**：批准执行的 tool 同样绑定当前请求 JWT（`app/ai/context.py`），透传 meta-service 无感知。
+
 ## 运行测试
 
 ```bash
 pytest tests -v
 ```
 
-测试覆盖：health / 服务信息端点；`get_current_user` 有效令牌解析、无 token / 伪造 / 过期 / refresh token / 未知 kid / 缺 user_id → 401；服务名白名单（非 superuser 未命中 → 403，superuser 豁免）；superuser 三重 AND 权限判定；Redis / PydanticAI 演示端点（mock）；Tool 注册与 `AI_ENABLED_TOOLS` 配置过滤；**审批流全链路**（触发 → taskid 暂存 → 批准执行/拒绝 → 消费，过期 410 / 越权 403）。
+测试覆盖：health / 服务信息端点；`get_current_user` 有效令牌解析、无 token / 伪造 / 过期 / refresh token / 未知 kid / 缺 user_id → 401；服务名白名单（非 superuser 未命中 → 403，superuser 豁免）；superuser 三重 AND 权限判定；Redis / PydanticAI 演示端点（mock）；Tool 注册与 `AI_ENABLED_TOOLS` 配置过滤；**审批流全链路**（触发 → taskid 暂存 → 批准执行/拒绝 → 消费，过期 410 / 越权 403）；**caloplan tools**（meta 内存 mock：food/meal/body/nutrition 读写、meal 快照与合计营养、upsert 语义、entity_key/user_id 注入、审批标记；审批续跑时真实执行 tool 并验证 JWT 透传 meta-service）。
 
 ## Docker 部署
 

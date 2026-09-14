@@ -8,7 +8,7 @@ import time
 from typing import Annotated
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.ai.service import resolve_approval, run_chat
 from app.core.dependencies import get_current_user
@@ -38,15 +38,27 @@ async def redis_ping(
 
 @router.post("/ai/chat", response_model=ChatResponse, summary="AI 对话（可触发需审批 Tool）", description="需要认证；正常回复或返回 need_approval=true + taskid 审批请求。")
 async def ai_chat(
+    request: Request,
     body: ChatRequest,
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> ChatResponse:
-    return await run_chat(current_user, body)
+    token = _extract_bearer(request)
+    return await run_chat(current_user, body, token)
 
 
 @router.post("/ai/approval", response_model=ApprovalDecisionResponse, summary="审批决定：执行/拒绝需审批 Tool", description="需要认证；携带 taskid 提交批准/拒绝，服务端执行后消费 taskid。")
 async def ai_approval(
+    request: Request,
     body: ApprovalDecisionRequest,
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> ApprovalDecisionResponse:
-    return await resolve_approval(current_user, body)
+    token = _extract_bearer(request)
+    return await resolve_approval(current_user, body, token)
+
+
+def _extract_bearer(request: Request) -> str | None:
+    """从 Authorization 头提取原始 JWT（供 tool 透传调用 meta-service）。"""
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return None
