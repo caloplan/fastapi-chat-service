@@ -55,6 +55,9 @@ def build_message_history(history: list[ChatMessage]) -> list[ModelMessage]:
 
 
 def _usage(usage: Any) -> UsageInfo:
+    # pydantic-ai 2.x：RunResult.usage 为属性（RunUsage 对象）；兼容测试 mock 中函数形态
+    if callable(usage):
+        usage = usage()
     return UsageInfo(
         prompt_tokens=getattr(usage, "input_tokens", 0),
         completion_tokens=getattr(usage, "output_tokens", 0),
@@ -64,6 +67,19 @@ def _usage(usage: Any) -> UsageInfo:
 
 def _approval_key(taskid: str) -> str:
     return f"{settings.REDIS_PREFIX}:approval:{taskid}"
+
+
+def _normalize_arguments(args: Any) -> dict[str, object] | None:
+    """pydantic-ai 2.x 的 ToolCallPart.args 为 JSON 字符串；兼容 dict 与非法输入。"""
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else None
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def _extract_tool_results(messages: Any) -> list[ToolCallResult]:
@@ -79,7 +95,7 @@ def _extract_tool_results(messages: Any) -> list[ToolCallResult]:
                 calls[part.tool_call_id] = ToolCallResult(
                     id=part.tool_call_id,
                     name=part.tool_name,
-                    arguments=part.args,
+                    arguments=_normalize_arguments(part.args),
                     result=None,
                 )
             elif isinstance(part, ToolReturnPart):
@@ -121,7 +137,7 @@ async def run_chat(user: CurrentUser, body: ChatRequest, token: str | None = Non
         output = result.output
         if isinstance(output, DeferredToolRequests):
             pending = [
-                PendingToolCall(tool_call_id=p.tool_call_id, name=p.tool_name, arguments=p.args)
+                PendingToolCall(tool_call_id=p.tool_call_id, name=p.tool_name, arguments=_normalize_arguments(p.args) or {})
                 for p in output.approvals
             ]
             taskid = uuid.uuid4().hex
@@ -143,7 +159,7 @@ async def run_chat(user: CurrentUser, body: ChatRequest, token: str | None = Non
             return ChatResponse(
                 conversation_id=conversation_id,
                 model=settings.AI_MODEL_NAME,
-                usage=_usage(result.usage()),
+                usage=_usage(result.usage),
                 latency_ms=latency_ms,
                 need_approval=True,
                 taskid=taskid,
@@ -154,7 +170,7 @@ async def run_chat(user: CurrentUser, body: ChatRequest, token: str | None = Non
             conversation_id=conversation_id,
             reply=str(output or ""),
             model=settings.AI_MODEL_NAME,
-            usage=_usage(result.usage()),
+            usage=_usage(result.usage),
             latency_ms=latency_ms,
             tool_calls=_extract_tool_results(result.all_messages()),
         )
@@ -220,7 +236,7 @@ async def resolve_approval(user: CurrentUser, body: ApprovalDecisionRequest, tok
             conversation_id=snapshot.get("conversation_id") or body.taskid,
             reply=str(result.output or ""),
             model=settings.AI_MODEL_NAME,
-            usage=_usage(result.usage()),
+            usage=_usage(result.usage),
             latency_ms=latency_ms,
             approved=body.approved,
             tool_results=_extract_tool_results(result.all_messages()),

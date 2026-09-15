@@ -111,3 +111,18 @@ async def test_ai_chat_invalid_body(client):
         json={},
     )
     assert resp.status_code == 422
+
+
+def test_extract_tool_results_str_args_regression():
+    """回归：pydantic-ai 2.x ToolCallPart.args 为 JSON 字符串，须规范化为 dict。"""
+    from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
+
+    from app.ai.service import _extract_tool_results
+
+    call = ToolCallPart(tool_name="create_food", args='{"name": "苹果"}', tool_call_id="c1")
+    ret = ToolReturnPart(tool_name="create_food", content="ok", tool_call_id="c1")
+    results = _extract_tool_results([ModelResponse(parts=[call]), ModelResponse(parts=[ret])])
+    assert len(results) == 1
+    assert results[0].name == "create_food"
+    assert results[0].arguments == {"name": "苹果"}
+    assert results[0].result == "ok"

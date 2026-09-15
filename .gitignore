@@ -6,6 +6,9 @@ __pycache__/
 build/
 dist/
 
+#Demo
+demo/
+
 # 虚拟环境
 .venv/
 venv/

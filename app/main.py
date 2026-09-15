@@ -1,12 +1,17 @@
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.redis import close_redis, init_redis
 from app.routes.infra import router as infra_router
 from app.utils.logger import setup_logger
+
+# demo 静态页目录（项目根/demo，同源访问 http://<host>:9095/demo/）
+_DEMO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "demo")
 
 
 @asynccontextmanager
@@ -45,6 +50,10 @@ def create_app() -> FastAPI:
 
     # 基础设施演示路由（Redis / PydanticAI，需认证）
     app.include_router(infra_router)
+
+    # demo 页面（同源静态挂载，避免 CORS；目录缺失时跳过挂载）
+    if os.path.isdir(_DEMO_DIR):
+        app.mount("/demo", StaticFiles(directory=_DEMO_DIR, html=True), name="demo")
 
     # 健康检查
     @app.get("/health", tags=["系统"], summary="健康检查")

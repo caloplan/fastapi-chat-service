@@ -216,6 +216,19 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 9095
 - **superuser 白名单**：部署时把 `SUPERUSER_USER_IDS` 改为 user-service 中实际 superuser 的 `user_id`（可在 user-service 的 `/api/v1/users` 列表查询）；
 - **服务名白名单**：部署时把 `ALLOWED_SERVICE_NAMES` 配成允许访问本服务的所有服务名（逗号分隔或 JSON 数组），未命中即 403（superuser 除外）。
 
+## Demo 页面（推荐从 3000 端口打开，防跨域）
+
+- 位置：`demo/index.html`，**推荐从 3000 端口访问**（Origin 已在 user-service / chat-service 的 CORS 白名单内，避免跨域拦截）：
+  ```bash
+  # 在项目根目录执行（任选其一）
+  python -m http.server 3000 --directory demo      # 或 npx serve demo -l 3000
+  # 浏览器打开 http://localhost:3000
+  ```
+- 也可从 chat-service 同源访问 **http://localhost:9095/demo/**（main.py 自动挂载 `/demo`）；
+- 功能：粘贴 user-service JWT 或页面内登录后即可对话；命中需审批 Tool 时展示审批卡片（tool 参数 + taskid），批准/拒绝后展示工具执行结果；
+- token 获取：user-service 的 `POST /api/v1/auth/login` 为 **OAuth2 表单格式**（`x-www-form-urlencoded`，非 JSON，页面内有正确 curl 指引）；
+- 配置：页面右上角"设置"可改 Chat Service / User Service 地址（默认 `http://localhost:3000`（chat-service 运行端口）与 user-service 实际地址）。
+
 ## 与 meta-service 对接（caloplan 数据域）
 
 - 本地联调：meta-service 运行在 `http://localhost:9093`（默认，见 `META_SERVICE_URL`）；Docker 部署用同网络服务名 `meta-service`；
