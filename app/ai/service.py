@@ -16,7 +16,17 @@ from typing import Any
 
 from fastapi import HTTPException, status
 from pydantic_ai import DeferredToolRequests, DeferredToolResults, ModelMessagesTypeAdapter
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
+from pydantic_ai.messages import (
+    ImageUrl,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextContent,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
 from app.ai.agent import get_ai_agent
 from app.ai.context import bind_ai_context
@@ -28,6 +38,7 @@ from app.schemas.ai import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
+    ContentBlock,
     MessageRole,
     PendingToolCall,
     ToolCallResult,
@@ -39,18 +50,44 @@ from app.utils.logger import get_logger
 logger = get_logger("ai_service")
 
 
+def _content_blocks_to_parts(content: str | list[ContentBlock]) -> list[TextContent | ImageUrl]:
+    """OpenAI/DeepSeek 风格 content（str 或内容块数组）→ pydantic-ai content parts。
+
+    文本块 → TextContent；image_url 块 → ImageUrl（data URL / http(s) URL 均可），
+    序列化后与 DeepSeek vision 的 content 数组格式一致。
+    """
+    if isinstance(content, str):
+        return [TextContent(content)] if content else []
+    parts: list[TextContent | ImageUrl] = []
+    for block in content:
+        if block.type == "text" and block.text:
+            parts.append(TextContent(block.text))
+        elif block.type == "image_url" and block.image_url:
+            url = block.image_url.get("url") if isinstance(block.image_url, dict) else block.image_url
+            if url:
+                parts.append(ImageUrl(url=url))
+    return parts
+
+
 def build_message_history(history: list[ChatMessage]) -> list[ModelMessage]:
     """客户端回传历史 → pydantic-ai 消息。
 
-    简化约定：仅转换 user / assistant 文本消息；system 提示由服务端
-    AI_SYSTEM_PROMPT 管理；tool 消息历史由审批快照管理，无需客户端回传。
+    简化约定：user 消息支持文本或内容块数组（可含 image_url 图片，多模态历史）；
+    assistant 仅文本（DeepSeek vision 限制图片只能出现在 user 消息）；
+    system 提示由服务端 AI_SYSTEM_PROMPT 管理；tool 消息历史由审批快照管理，无需客户端回传。
     """
     messages: list[ModelMessage] = []
     for msg in history:
         if msg.role == MessageRole.user:
-            messages.append(ModelRequest(parts=[UserPromptPart(content=msg.content)]))
+            parts = _content_blocks_to_parts(msg.content)
+            if not parts:
+                continue  # 空内容消息无意义，跳过
+            messages.append(ModelRequest(parts=[UserPromptPart(content=parts)]))
         elif msg.role == MessageRole.assistant:
-            messages.append(ModelResponse(parts=[TextPart(content=msg.content)]))
+            text = msg.content if isinstance(msg.content, str) else "".join(b.text or "" for b in msg.content)
+            if not text:
+                continue
+            messages.append(ModelResponse(parts=[TextPart(content=text)]))
     return messages
 
 

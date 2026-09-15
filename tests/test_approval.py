@@ -144,6 +144,7 @@ def meta_mock_env(monkeypatch):
                 "type_name": body["type_name"],
                 "entity_key": body["entity_key"],
                 "data": body["data"],
+                "owner_user_id": 1,  # 模拟 meta：从 JWT 自动写入 entry 元数据
             }
             entries[(body["type_name"], body["entity_key"])] = entry
             return httpx.Response(201, json=entry)
@@ -384,8 +385,8 @@ async def test_approval_resume_passes_jwt_to_meta(
     assert meta_calls, "tool 应实际调用 meta-service"
     for req in meta_calls:
         assert req.headers["Authorization"] == f"Bearer {token}"
-    # 食物已真实落库（entityKey 由服务端生成，data.user_id 注入）
+    # 食物已真实落库（entityKey 由服务端生成；user_id 是 entry 元数据 owner_user_id，meta 自动注入）
     assert any(
-        type_name == "food" and entry["data"]["user_id"] == "1"
+        type_name == "food" and "user_id" not in entry["data"] and entry["owner_user_id"] == 1
         for (type_name, _key), entry in meta_entries.items()
     )

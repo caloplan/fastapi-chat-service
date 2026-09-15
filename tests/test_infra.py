@@ -118,7 +118,6 @@ def test_extract_tool_results_str_args_regression():
     from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
 
     from app.ai.service import _extract_tool_results
-
     call = ToolCallPart(tool_name="create_food", args='{"name": "苹果"}', tool_call_id="c1")
     ret = ToolReturnPart(tool_name="create_food", content="ok", tool_call_id="c1")
     results = _extract_tool_results([ModelResponse(parts=[call]), ModelResponse(parts=[ret])])
@@ -126,3 +125,97 @@ def test_extract_tool_results_str_args_regression():
     assert results[0].name == "create_food"
     assert results[0].arguments == {"name": "苹果"}
     assert results[0].result == "ok"
+
+
+# ── 多模态历史：content 数组（含 image_url）兼容 ─────────────
+
+def test_build_message_history_supports_image_url_content():
+    """user 消息 content 数组（text + image_url）→ TextContent + ImageUrl parts；assistant 数组拼接文本。"""
+    from pydantic_ai.messages import ImageUrl, TextContent, TextPart, UserPromptPart
+
+    from app.ai.service import build_message_history
+    from app.schemas.ai import ChatMessage, ContentBlock, MessageRole
+
+    history = [
+        ChatMessage(
+            role=MessageRole.user,
+            content=[
+                ContentBlock(type="text", text="看这张图"),
+                ContentBlock(type="image_url", image_url={"url": "data:image/jpeg;base64,AAAA"}),
+            ],
+        ),
+        ChatMessage(role=MessageRole.assistant, content="看到了"),
+    ]
+    msgs = build_message_history(history)
+    assert len(msgs) == 2
+
+    user_part = msgs[0].parts[0]
+    assert isinstance(user_part, UserPromptPart)
+    assert isinstance(user_part.content, list)
+    assert isinstance(user_part.content[0], TextContent)
+    assert user_part.content[0].content == "看这张图"
+    assert isinstance(user_part.content[1], ImageUrl)
+    assert user_part.content[1].url == "data:image/jpeg;base64,AAAA"
+
+    # assistant 仅文本（拼接 text 块）
+    assert isinstance(msgs[1].parts[0], TextPart)
+    assert msgs[1].parts[0].content == "看到了"
+
+
+def test_build_message_history_image_url_as_plain_string():
+    """image_url 块兼容字符串形式（非 {"url": ...} 包裹）。"""
+    from pydantic_ai.messages import ImageUrl
+
+    from app.ai.service import build_message_history
+    from app.schemas.ai import ChatMessage, ContentBlock, MessageRole
+
+    history = [
+        ChatMessage(
+            role=MessageRole.user,
+            content=[ContentBlock(type="image_url", image_url="https://example.com/a.jpg")],
+        ),
+    ]
+    msgs = build_message_history(history)
+    part = msgs[0].parts[0]
+    assert isinstance(part.content[0], ImageUrl)
+    assert part.content[0].url == "https://example.com/a.jpg"
+
+
+async def test_ai_chat_accepts_image_url_history(client, monkeypatch):
+    """端到端：请求体 history 带 image_url content 数组 → 200，且历史正确含 ImageUrl part。"""
+    from pydantic_ai.messages import ImageUrl
+
+    seen: dict[str, object] = {}
+
+    class _Agent:
+        async def run(self, message: str, **kwargs: object) -> SimpleNamespace:
+            seen["history"] = kwargs.get("message_history", [])
+            return SimpleNamespace(
+                output="ok",
+                usage=lambda: SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+                all_messages=lambda: [],
+            )
+
+    monkeypatch.setattr("app.ai.service.get_ai_agent", lambda: _Agent())
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={
+            "message": "继续",
+            "history": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看看这张图"},
+                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB"}},
+                    ],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["reply"] == "ok"
+    hist = seen["history"]
+    assert len(hist) == 1
+    parts = hist[0].parts[0].content
+    assert any(isinstance(p, ImageUrl) for p in parts)

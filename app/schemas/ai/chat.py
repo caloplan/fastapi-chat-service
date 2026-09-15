@@ -1,6 +1,7 @@
 """对话消息 / 请求 / 响应（方案 A：纯无状态，历史由客户端携带）。"""
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +17,19 @@ class MessageRole(str, Enum):
     tool = "tool"
 
 
+class ContentBlock(BaseModel):
+    """OpenAI/DeepSeek 兼容的内容块（content 为数组时使用）。
+
+    仅支持文本与图片：{type:"text", text:"..."} 或
+    {type:"image_url", image_url:{"url":"data:image/jpeg;base64,..."}}。
+    图片仅允许出现在 user 消息（DeepSeek vision：system/assistant 带图返回 400）。
+    """
+
+    type: Literal["text", "image_url"]
+    text: str | None = None  # type=text 时
+    image_url: str | dict[str, str] | None = None  # type=image_url：URL 字符串或 {"url": ...}
+
+
 class ToolCall(BaseModel):
     """模型发起的一次工具调用。"""
 
@@ -25,10 +39,14 @@ class ToolCall(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    """对话消息（客户端回传历史时使用）。"""
+    """对话消息（客户端回传历史时使用）。
+
+    content 兼容纯文本字符串，或 OpenAI/DeepSeek 风格的内容块数组
+    （可含 image_url 图片块，用于多模态历史回传）。
+    """
 
     role: MessageRole
-    content: str = ""
+    content: str | list[ContentBlock] = ""
     tool_calls: list[ToolCall] | None = None  # role=assistant 且发起工具调用时
     tool_call_id: str | None = None  # role=tool 时回填对应调用 id
 

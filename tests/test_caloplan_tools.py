@@ -115,7 +115,9 @@ async def test_create_food_success(meta_mock):
     assert len(result["id"]) == 8  # uuid4 短码
     entry = entries[("food", result["id"])]
     data = entry["data"]
-    assert data["user_id"] == "42"  # 服务端注入，非模型提供
+    # user_id 是 entry 元数据（owner_user_id），不进入 data 业务字段
+    assert "user_id" not in data
+    assert entry["owner_user_id"] == 42  # meta 从 JWT 自动写入
     assert data["unit"] == {"unit": "个", "value": 1}
     assert data["nutrition"]["carbon"] == {"unit": "kg", "value": 0.2}
     assert data["nutrition"]["salt"] == {"unit": "g", "value": 0.001}
@@ -212,7 +214,8 @@ async def test_create_meal_success(meta_mock):
     data = meal["data"]
     assert data["type"] == "breakfast"
     assert data["tips"] == "元气早餐"
-    assert data["user_id"] == "42"
+    assert "user_id" not in data
+    assert meal["owner_user_id"] == 42  # meta 从 JWT 自动写入
     # 快照：nutrition × amount
     assert data["foods"]["aaaaaaaa"]["amount"] == 2
     assert data["foods"]["aaaaaaaa"]["nutrition"]["energy"] == {"unit": "kcal", "value": 100}  # 50 × 2
@@ -245,7 +248,8 @@ async def test_upsert_body_creates_when_no_record(meta_mock):
     assert result["action"] == "created"
     entry = entries[("body", result["id"])]
     assert entry["data"]["date"] == "2026-09-14"
-    assert entry["data"]["user_id"] == "42"
+    assert "user_id" not in entry["data"]
+    assert entry["owner_user_id"] == 42
     assert entry["data"]["weight"] == 75
 
 
@@ -330,3 +334,79 @@ async def test_tool_outside_context_raises():
     """未绑定请求上下文时调用 tool → RuntimeError（防止越权/串号）。"""
     with pytest.raises(RuntimeError, match="未绑定"):
         await list_my_food()
+
+
+# ── owner 隔离（meta 仅按 service 隔离，同 service 多用户数据互不可见）────────
+
+async def test_upsert_body_ignores_other_users_record(meta_mock):
+    """同日存在他人 body 记录（owner_user_id 不同）→ 视为无记录，走 created 而非 update。"""
+    entries, _calls = meta_mock
+    entries[("body", "cccccccc")] = _entry(
+        "body",
+        "cccccccc",
+        {"date": "2026-09-14", "age": 30, "height": 170, "weight": 60},
+        owner_user_id=99,  # 他人
+    )
+    with bind_ai_context("t", TEST_USER):
+        result = await upsert_my_body(UpsertBodyParams(date="2026-09-14", age=25, height=180, weight=75))
+    assert result["ok"] is True
+    assert result["action"] == "created"
+    # 他人记录未被修改
+    assert entries[("body", "cccccccc")]["version"] == 1
+    assert entries[("body", "cccccccc")]["data"]["weight"] == 60
+
+
+async def test_get_my_body_by_date_ignores_other_user(meta_mock):
+    """查询仅返回当前用户记录：同日他人记录 → found=false。"""
+    entries, _calls = meta_mock
+    entries[("body", "cccccccc")] = _entry(
+        "body", "cccccccc", {"date": "2026-09-14", "age": 30, "height": 170, "weight": 60},
+        owner_user_id=99,  # 他人
+    )
+    with bind_ai_context("t", TEST_USER):
+        result = await get_my_body_by_date("2026-09-14")
+    assert result["ok"] is True
+    assert result["found"] is False
+
+
+async def test_list_my_food_excludes_other_users(meta_mock):
+    """食物列表按 owner 隔离：他人 food 不出现。"""
+    entries, _calls = meta_mock
+    entries[("food", "aaaaaaaa")] = _entry(
+        "food", "aaaaaaaa",
+        {"id": "aaaaaaaa", "name": "我的苹果", "image": "", "unit": {"unit": "个", "value": 1},
+         "nutrition": {"carbon": {"unit": "kg", "value": 0.2}, "protein": {"unit": "kg", "value": 0.1},
+                       "fat": {"unit": "kg", "value": 0.05}, "salt": {"unit": "g", "value": 0.001},
+                       "energy": {"unit": "kcal", "value": 100}}},
+        owner_user_id=42,
+    )
+    entries[("food", "bbbbbbbb")] = _entry(
+        "food", "bbbbbbbb",
+        {"id": "bbbbbbbb", "name": "他人的面包", "image": "", "unit": {"unit": "个", "value": 1},
+         "nutrition": {"carbon": {"unit": "kg", "value": 0.2}, "protein": {"unit": "kg", "value": 0.1},
+                       "fat": {"unit": "kg", "value": 0.05}, "salt": {"unit": "g", "value": 0.001},
+                       "energy": {"unit": "kcal", "value": 100}}},
+        owner_user_id=99,  # 他人
+    )
+    with bind_ai_context("t", TEST_USER):
+        result = await list_my_food()
+    assert result["ok"] is True
+    assert result["total"] == 1
+    assert result["items"][0]["id"] == "aaaaaaaa"
+    assert "bbbbbbbb" not in [it["id"] for it in result["items"]]
+
+
+async def test_create_meal_rejects_other_users_food(meta_mock):
+    """create_meal 引用他人 food → 视为未找到，报错不落库。"""
+    entries, _calls = meta_mock
+    entries[("food", "bbbbbbbb")] = _food_entry("bbbbbbbb", "他人的面包", 100)
+    # 他人 food 的 owner 改为 99
+    entries[("food", "bbbbbbbb")]["owner_user_id"] = 99
+    with bind_ai_context("t", TEST_USER):
+        result = await create_meal(
+            CreateMealParams(type="dinner", foods=[MealFoodItem(food_id="bbbbbbbb", amount=1)])
+        )
+    assert result["ok"] is False
+    assert "未找到食物" in result["error"]
+    assert "bbbbbbbb" in result["error"]
+    assert not any(t == "meal" for (t, _k) in entries)

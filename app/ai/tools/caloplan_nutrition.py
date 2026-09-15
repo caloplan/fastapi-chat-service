@@ -4,7 +4,9 @@
 - upsert_my_nutrition：写操作（requires_approval=True）。查当日记录：
   无 → 创建；有 → 按 id 更新（仅变更字段）。
 
-落库字段 snake_case：{id, user_id, date, carbon, protein, fat, salt, calorie, created_time}。
+data 只存业务字段：{date, carbon, protein, fat, salt, calorie}；
+user_id 是 MetaSDK entry 元数据（owner_user_id），创建时由 meta 自动写入，
+查询后按响应 owner_user_id 过滤当前用户（meta 仅按 service 隔离）。
 注意：营养目标为纯数值（碳/蛋白/脂肪 kg、盐 g、热量 kcal），与 food.nutrition 的带单位对象不同。
 """
 
@@ -12,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from app.ai.context import require_ai_context
 from app.ai.tools import register_tool
-from app.ai.tools._caloplan_common import gen_entity_key, now_iso, today_str
+from app.ai.tools._caloplan_common import filter_by_owner, gen_entity_key, today_str
 from app.ai.tools.meta_client import MetaApiError, get_meta_client
 
 _NUTRITION_TYPE = "nutrition"
@@ -44,19 +46,14 @@ async def upsert_my_nutrition(params: UpsertNutritionParams) -> dict:
     values = {field: getattr(params, field) for field in _NUTRITION_FIELDS}
 
     try:
-        result = await client.query_entries(_NUTRITION_TYPE, filters={"user_id": str(ctx.user.user_id), "date": date})
-        existing = (result.get("items") or [None])[0]
+        result = await client.query_entries(_NUTRITION_TYPE, filters={"date": date})
+        items = filter_by_owner(result.get("items", []), str(ctx.user.user_id))
+        existing = items[0] if items else None
         if existing is not None:
             entry = await client.update_entry(_NUTRITION_TYPE, existing["entity_key"], values)
             return {"ok": True, "action": "updated", "id": entry.get("entity_key"), "date": date, **values}
         entity_key = gen_entity_key()
-        data = {
-            "id": entity_key,
-            "user_id": str(ctx.user.user_id),
-            "date": date,
-            **values,
-            "created_time": now_iso(),
-        }
+        data = {"date": date, **values}
         await client.create_entry(_NUTRITION_TYPE, entity_key, data)
         return {"ok": True, "action": "created", "id": entity_key, "date": date, **values}
     except MetaApiError as exc:
@@ -72,10 +69,10 @@ async def get_my_nutrition_by_date(date: str) -> dict:
     ctx = require_ai_context()
     client = get_meta_client()
     try:
-        result = await client.query_entries(_NUTRITION_TYPE, filters={"user_id": str(ctx.user.user_id), "date": date})
+        result = await client.query_entries(_NUTRITION_TYPE, filters={"date": date})
     except MetaApiError as exc:
         return {"ok": False, "error": exc.message}
-    items = result.get("items", [])
+    items = filter_by_owner(result.get("items", []), str(ctx.user.user_id))
     if not items:
         return {"ok": True, "found": False, "date": date}
     data = items[0].get("data", {})

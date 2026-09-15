@@ -5,6 +5,11 @@
   服务端按 food_id 批量查 food 后构造快照（name/image/unit/nutrition×amount）并合计营养——
   营养数据全部来自真实食物库，防止模型编造；未找到的 food_id 直接报错。
 
+data 只存业务字段：{id, tips, type, foods, nutrition}（id 为业务 meal_id）；
+user_id 是 MetaSDK entry 元数据（owner_user_id），创建时由 meta 自动写入。
+meta 仅按 service 隔离（同 service 多用户数据互相可见），因此查询与 batch 引用
+食物均按响应 owner_user_id 过滤——他人的 food 视为未找到，防止越权引用。
+
 落库 foods 为快照结构（对齐 caloplan-core MealFoodSnapshot）：
 {foodId, name, image, unit, amount, nutrition:{carbon/protein/fat:{unit,value},...}}
 """
@@ -18,8 +23,8 @@ from app.ai.tools import register_tool
 from app.ai.tools._caloplan_common import (
     NUTRITION_KEYS,
     NUTRITION_UNITS,
+    filter_by_owner,
     gen_entity_key,
-    now_iso,
     nutrition_from_data,
     simplify_meal_entry,
 )
@@ -69,6 +74,15 @@ async def create_meal(params: CreateMealParams) -> dict:
     except MetaApiError as exc:
         return {"ok": False, "error": exc.message}
 
+    # 按 owner_user_id 过滤：meta batch 仅按 service 隔离，他人的 food 视为未找到，
+    # 防止 agent 引用同 service 其他用户的食物（用户数据隔离）。
+    uid = str(ctx.user.user_id)
+    batch = {
+        key: entry
+        for key, entry in batch.items()
+        if entry is not None and str(entry.get("owner_user_id")) == uid
+    }
+
     # 未找到的 food_id 一律报错（不静默跳过），提示先查询有效食物
     missing = [key for key in keys if batch.get(key) is None]
     if missing:
@@ -95,12 +109,10 @@ async def create_meal(params: CreateMealParams) -> dict:
     entity_key = gen_entity_key()
     meal_data = {
         "id": entity_key,
-        "user_id": str(ctx.user.user_id),
         "tips": params.tips,
         "type": params.type,
         "foods": snapshots,
         "nutrition": {key: {"unit": NUTRITION_UNITS[key], "value": round(totals[key], 4)} for key in NUTRITION_KEYS},
-        "created_time": now_iso(),
     }
     try:
         await client.create_entry(_MEAL_TYPE, entity_key, meal_data)
@@ -122,15 +134,18 @@ async def create_meal(params: CreateMealParams) -> dict:
     description="查询我的膳食记录列表：返回每条膳食的 id / 餐次 / 备注 / 各食物份数 / 合计营养。",
 )
 async def list_my_meal() -> dict:
-    """查询当前用户膳食列表。"""
+    """查询当前用户膳食列表（meta 按 service 隔离，返回后按 owner_user_id 过滤当前用户）。"""
     ctx = require_ai_context()
     client = get_meta_client()
     try:
-        result = await client.query_entries(_MEAL_TYPE, filters={"user_id": str(ctx.user.user_id)})
+        result = await client.query_entries(_MEAL_TYPE)
     except MetaApiError as exc:
         return {"ok": False, "error": exc.message}
-    items = [simplify_meal_entry(it) for it in result.get("items", [])]
-    return {"ok": True, "total": result.get("total", 0), "items": items}
+    items = [
+        simplify_meal_entry(it)
+        for it in filter_by_owner(result.get("items", []), str(ctx.user.user_id))
+    ]
+    return {"ok": True, "total": len(items), "items": items}
 
 
 __all__ = ["CreateMealParams", "MealFoodItem", "create_meal", "list_my_meal"]

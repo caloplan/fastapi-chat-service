@@ -73,9 +73,20 @@ def simplify_meal_entry(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def filter_by_owner(items: list[dict[str, Any]], user_id: str | int) -> list[dict[str, Any]]:
+    """按 entry 元数据 owner_user_id 过滤（meta 仅按 service 隔离，同 service 多用户需本地再隔离）。
+
+    owner_user_id 是 MetaSDK entry 的元数据字段（创建时由 meta 从 JWT 自动写入），
+    不在 data 业务字段里，因此查询响应后需按该顶层字段过滤当前用户的数据。
+    """
+    uid = str(user_id)
+    return [it for it in items if str(it.get("owner_user_id")) == uid]
+
+
 __all__ = [
     "NUTRITION_KEYS",
     "NUTRITION_UNITS",
+    "filter_by_owner",
     "gen_entity_key",
     "now_iso",
     "nutrition_from_data",
