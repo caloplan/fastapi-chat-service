@@ -69,6 +69,24 @@ def _content_blocks_to_parts(content: str | list[ContentBlock]) -> list[TextCont
     return parts
 
 
+def _message_to_prompt(message: str | list[ContentBlock]) -> str | list[TextContent | ImageUrl]:
+    """当前轮 message → pydantic-ai run()/run_stream() 的 prompt 参数。
+
+    str → 直接作为 prompt；内容块数组（text + image_url，url/base64 均可）→
+    转 TextContent/ImageUrl parts（pydantic-ai run 的 prompt 支持 parts 列表，
+    图片直接传 parts，无需包 UserPromptPart）。
+    """
+    if isinstance(message, str):
+        return message
+    parts = _content_blocks_to_parts(message)
+    if not parts:
+        raise HTTPException(
+            status_code=422,
+            detail="message 内容块不能为空（需至少一个有效的 text / image_url 块）",
+        )
+    return parts
+
+
 def build_message_history(history: list[ChatMessage]) -> list[ModelMessage]:
     """客户端回传历史 → pydantic-ai 消息。
 
@@ -186,9 +204,12 @@ async def run_chat(user: CurrentUser, body: ChatRequest, token: str | None = Non
         history = build_message_history(body.history)
         conversation_id = body.conversation_id or uuid.uuid4().hex
 
+        # prompt 解析/校验在 AI 调用之外：message 内容块无效直接 422，不被 502 包装
+        prompt = _message_to_prompt(body.message)
+
         start = time.perf_counter()
         try:
-            result = await agent.run(body.message, message_history=history)
+            result = await agent.run(prompt, message_history=history)
         except Exception as exc:
             logger.error("AI 对话失败: %s", exc)
             raise HTTPException(
@@ -260,13 +281,16 @@ async def run_chat_stream(user: CurrentUser, body: ChatRequest, token: str | Non
         history = build_message_history(body.history)
         conversation_id = body.conversation_id or uuid.uuid4().hex
 
+        # prompt 解析/校验在 AI 调用之外：message 内容块无效直接 422，不被 502 包装
+        prompt = _message_to_prompt(body.message)
+
         start = time.perf_counter()
         chunks: list[str] = []
         try:
             # run_stream 返回异步上下文管理器（__aenter__ 产出 StreamedRunResult），不可直接 await
             # 注意：stream_text(delta=True) 才 yield 增量；默认 delta=False 会 yield 到当前点的完整前缀，
             # 客户端按增量累加会重复拼接（同一条文本重复出现）。
-            async with agent.run_stream(body.message, message_history=history) as result:
+            async with agent.run_stream(prompt, message_history=history) as result:
                 async for chunk in result.stream_text(delta=True):
                     chunks.append(chunk)
                     yield _sse({"type": "text", "content": chunk})

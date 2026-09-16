@@ -54,7 +54,9 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     """对话请求（无状态：历史由客户端携带，服务端零留存）。"""
 
-    message: str = Field(..., min_length=1, max_length=8000)
+    # 当前轮输入：纯文本，或 OpenAI/DeepSeek 风格内容块数组（可含 image_url 图片，
+    # url 字符串 / {"url": ...} 包裹 / base64 data URL 均可）。图片支持取决于模型（deepseek-flash）。
+    message: str | list[ContentBlock] = Field(..., min_length=1, max_length=8000)
     conversation_id: str | None = Field(None, max_length=64)  # 客户端生成，仅日志关联/幂等用
     history: list[ChatMessage] = Field(default_factory=list, max_length=40)
     params: ModelParams = Field(default_factory=ModelParams)

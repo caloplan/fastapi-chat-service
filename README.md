@@ -122,7 +122,7 @@ data: {"type":"done","conversation_id":"…","reply":"这是第一段增量这�
   直接推 `approval` 事件 + `done`（`need_approval=true`，含 `taskid`/`pending_tools`，语义与 JSON 分支相同），
   客户端据 `done.need_approval` 显示审批卡即可；
 - **出错时**：推 `{"type":"error","detail":"…"}` 后结束流；
-- 多模态历史（history 带 image_url）与 `stream=true` 可同时使用（前提同为 `deepseek-flash`）。
+- 多模态（当前轮 message / history 带 image_url）与 `stream=true` 可同时使用（前提同为 `deepseek-flash`）。
 
 curl 示例：
 
@@ -132,10 +132,24 @@ curl -N -X POST http://localhost:9095/api/v1/ai/chat \
   -d '{"message":"讲个冷笑话","stream":true}'
 ```
 
-### 多模态历史（history 携带图片）
+### 多模态：当前轮 message 与 history 均可携带图片
 
-`history` 中的 **user 消息** content 支持 OpenAI/DeepSeek 风格的内容块数组（文本 + 图片），
-图片以 `image_url` 块传入（base64 data URL 或公开 http(s) URL）：
+**当前轮 `message`** 支持纯文本，或 OpenAI/DeepSeek 风格内容块数组（文本 + 图片），
+图片以 `image_url` 块传入，**url 与 base64 data URL 两种形式均可**：
+
+```json
+{
+  "message": [
+    {"type": "text", "text": "这张图里的食物营养怎么样？"},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."}}
+  ]
+}
+```
+
+纯图片提问（无文本）也可直接传 `[{"type":"image_url","image_url":{"url":"https://…/a.jpg"}}]`。
+`image_url` 兼容 `{"url": "…"}` 包裹或纯字符串两种写法。
+
+**`history` 回传**同样支持：**user 消息**的 content 可为内容块数组（文本 + 图片）：
 
 ```json
 {
@@ -153,14 +167,14 @@ curl -N -X POST http://localhost:9095/api/v1/ai/chat \
 }
 ```
 
-服务端自动把数组解析为 pydantic-ai 的 `TextContent`/`ImageUrl` parts，序列化后与
-DeepSeek vision 的 content 数组格式完全一致（已实测验证），**无需新增请求字段**。
+服务端自动把数组解析为 pydantic-ai 的 `TextContent`/`ImageUrl` parts（`_message_to_prompt` /
+`_content_blocks_to_parts`），序列化后与 DeepSeek vision 的 content 数组格式完全一致（已实测验证）。
 
 **前提与限制**：
 - 模型必须是 **`deepseek-flash`**（`AI_MODEL_NAME=deepseek-flash`；`deepseek-chat` 不支持图片）；
 - 图片只允许出现在 **user** 消息（system/assistant 带图 → DeepSeek 返回 400）；
-- 格式 JPEG/PNG/GIF/WebP；base64 内联受 48MiB 请求体限制、单图 token 上限 1024；
-- 当前轮 `message` 仍为纯文本，图片走历史回传。
+- 格式 JPEG/PNG/GIF/WebP；base64 内联受 48MiB 请求体限制、外部 URL ≤8192 字符、单图 token 上限 1024；
+- 内容块数组为空/全无效 → 422；与 `stream=true` 可同时使用。
 
 ## Tool 体系（caloplan 数据域）
 
@@ -261,15 +275,15 @@ python scripts/init_meta_types.py --token <superuser-jwt> --base-url http://120.
 ## 运行测试
 
 ```bash
-pytest tests -v    # 当前 66 passed
+pytest tests -v    # 当前 70 passed
 ```
 
 覆盖：认证（令牌解析/白名单/权限三重 AND）；Redis/AI 端点（mock）；Tool 注册与配置过滤；
 审批流全链路（触发→暂存→批准/拒绝→消费，过期 410/越权 403，续跑 JWT 透传）；caloplan tools
 （meta 内存 mock：读写、meal 快照与合计营养、upsert 语义、**owner 隔离**、entity_key 注入）；
-**多模态历史**（content 数组含 image_url → TextContent/ImageUrl parts，端到端 422→200）；
-**SSE 流式**（stream=true：text 增量 + done 终态；审批分支 approval 事件 + done(need_approval=true)、
-快照入库；stream 缺省仍为 JSON）。
+**多模态**（history content 数组 → TextContent/ImageUrl parts；**当前轮 message 数组**（base64/url/纯字符串 URL），
+空块 422，端到端 422→200）；**SSE 流式**（stream=true：text 增量 + done 终态；审批分支 approval 事件 +
+done(need_approval=true)、快照入库；stream 缺省仍为 JSON）。
 
 ## 项目结构
 

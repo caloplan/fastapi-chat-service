@@ -387,3 +387,107 @@ async def test_ai_chat_accepts_image_url_history(client, monkeypatch):
     assert len(hist) == 1
     parts = hist[0].parts[0].content
     assert any(isinstance(p, ImageUrl) for p in parts)
+
+
+# ── 当前轮 message 支持内容块数组（text + image_url，url/base64） ───────────
+
+async def test_ai_chat_message_content_blocks(client, monkeypatch):
+    """当前轮 message 为 content 数组（text + image_url base64）→ prompt 转 TextContent/ImageUrl parts。"""
+    from pydantic_ai.messages import ImageUrl, TextContent
+
+    seen: dict[str, object] = {}
+
+    class _Agent:
+        async def run(self, message: object, **kwargs: object) -> SimpleNamespace:
+            seen["prompt"] = message
+            return SimpleNamespace(
+                output="ok",
+                usage=lambda: SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+                all_messages=lambda: [],
+            )
+
+    monkeypatch.setattr("app.ai.service.get_ai_agent", lambda: _Agent())
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={
+            "message": [
+                {"type": "text", "text": "分析这张图"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,CCCC"}},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    prompt = seen["prompt"]
+    assert isinstance(prompt, list)
+    assert isinstance(prompt[0], TextContent)
+    assert prompt[0].content == "分析这张图"
+    assert isinstance(prompt[1], ImageUrl)
+    assert prompt[1].url == "data:image/jpeg;base64,CCCC"
+
+
+async def test_ai_chat_message_image_url_plain_string(client, monkeypatch):
+    """message 的 image_url 兼容纯字符串 URL 形式（http(s) 外部链接）。"""
+    from pydantic_ai.messages import ImageUrl
+
+    seen: dict[str, object] = {}
+
+    class _Agent:
+        async def run(self, message: object, **kwargs: object) -> SimpleNamespace:
+            seen["prompt"] = message
+            return SimpleNamespace(
+                output="ok",
+                usage=lambda: SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+                all_messages=lambda: [],
+            )
+
+    monkeypatch.setattr("app.ai.service.get_ai_agent", lambda: _Agent())
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={"message": [{"type": "image_url", "image_url": "https://example.com/a.jpg"}]},
+    )
+    assert resp.status_code == 200
+    prompt = seen["prompt"]
+    assert isinstance(prompt[1] if len(prompt) > 1 else prompt[0], ImageUrl)
+
+
+async def test_ai_chat_stream_message_content_blocks(client, monkeypatch):
+    """stream=true 时 message 数组同样转 parts 传入 run_stream。"""
+    seen: dict[str, object] = {}
+
+    class _Agent:
+        def run_stream(self, message: object, **kwargs: object) -> _StreamContext:
+            seen["prompt"] = message
+            return _StreamContext(_StreamResult("ok", ["ok"]))
+
+    monkeypatch.setattr("app.ai.service.get_ai_agent", lambda: _Agent())
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={
+            "message": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/b.jpg"}},
+                {"type": "text", "text": "这是什么"},
+            ],
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert _sse_events(resp.text)[-1]["type"] == "done"
+    from pydantic_ai.messages import ImageUrl, TextContent
+
+    prompt = seen["prompt"]
+    assert isinstance(prompt, list)
+    assert isinstance(prompt[0], ImageUrl)
+    assert isinstance(prompt[1], TextContent)
+
+
+async def test_ai_chat_message_empty_blocks_rejected(client):
+    """message 内容块数组无有效块（如 image_url 为空）→ 422。"""
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={"message": [{"type": "image_url", "image_url": None}]},
+    )
+    assert resp.status_code == 422
