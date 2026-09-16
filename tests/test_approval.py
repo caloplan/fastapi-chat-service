@@ -387,6 +387,6 @@ async def test_approval_resume_passes_jwt_to_meta(
         assert req.headers["Authorization"] == f"Bearer {token}"
     # 食物已真实落库（entityKey 由服务端生成；user_id 是 entry 元数据 owner_user_id，meta 自动注入）
     assert any(
-        type_name == "food" and "user_id" not in entry["data"] and entry["owner_user_id"] == 1
+        type_name == "food" and entry["data"].get("user_id") == "1" and "created_time" in entry["data"] and entry["owner_user_id"] == 1
         for (type_name, _key), entry in meta_entries.items()
     )

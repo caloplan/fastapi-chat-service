@@ -59,7 +59,7 @@ async def upsert_my_body(params: UpsertBodyParams) -> dict:
             entry = await client.update_entry(_BODY_TYPE, existing["entity_key"], values)
             return {"ok": True, "action": "updated", "id": entry.get("entity_key"), "date": date, **values}
         entity_key = gen_entity_key()
-        data = {"date": date, **values}
+        data = {"date": date, "user_id": str(ctx.user.user_id), "created_time": today_str(), **values}
         await client.create_entry(_BODY_TYPE, entity_key, data)
         return {"ok": True, "action": "created", "id": entity_key, "date": date, **values}
     except MetaApiError as exc:

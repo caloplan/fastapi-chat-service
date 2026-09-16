@@ -19,6 +19,7 @@ from app.ai.tools._caloplan_common import (
     nutrition_from_data,
     nutrition_to_data,
     simplify_food_entry,
+    today_str,
 )
 from app.ai.tools.meta_client import MetaApiError, get_meta_client
 
@@ -56,6 +57,8 @@ async def create_food(params: CreateFoodParams) -> dict:
     entity_key = gen_entity_key()
     data = {
         "id": entity_key,
+        "user_id": str(ctx.user.user_id),
+        "created_time": today_str(),
         "name": params.name,
         "image": "",
         "unit": {"unit": params.unit, "value": params.unit_value},

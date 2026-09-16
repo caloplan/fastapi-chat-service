@@ -440,9 +440,20 @@ async def resolve_approval(user: CurrentUser, body: ApprovalDecisionRequest, tok
 
         logger.info("审批任务已消费: taskid=%s approved=%s", body.taskid, body.approved)
 
+        output = result.output
+        if isinstance(output, DeferredToolRequests):
+            # 防御：工具执行失败/未完成时，不把内部对象 repr 透传给前端
+            failed = [p.tool_name for p in output.approvals]
+            reply = (
+                f"操作未完成：{', '.join(failed)} 执行失败，请重试。"
+                if failed
+                else "操作未完成，请重试。"
+            )
+        else:
+            reply = str(output or "")
         return ApprovalDecisionResponse(
             conversation_id=snapshot.get("conversation_id") or body.taskid,
-            reply=str(result.output or ""),
+            reply=reply,
             model=settings.AI_MODEL_NAME,
             usage=_usage(result.usage),
             latency_ms=latency_ms,

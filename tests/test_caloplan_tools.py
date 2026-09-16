@@ -8,6 +8,7 @@
 """
 
 import json
+import re
 
 import httpx
 import pytest
@@ -116,7 +117,8 @@ async def test_create_food_success(meta_mock):
     entry = entries[("food", result["id"])]
     data = entry["data"]
     # user_id 是 entry 元数据（owner_user_id），不进入 data 业务字段
-    assert "user_id" not in data
+    assert data["user_id"] == "42"  # meta schema required
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", data["created_time"]) is not None
     assert entry["owner_user_id"] == 42  # meta 从 JWT 自动写入
     assert data["unit"] == {"unit": "个", "value": 1}
     assert data["nutrition"]["carbon"] == {"unit": "kg", "value": 0.2}
@@ -214,7 +216,8 @@ async def test_create_meal_success(meta_mock):
     data = meal["data"]
     assert data["type"] == "breakfast"
     assert data["tips"] == "元气早餐"
-    assert "user_id" not in data
+    assert data["user_id"] == "42"  # meta schema required
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", data["created_time"]) is not None
     assert meal["owner_user_id"] == 42  # meta 从 JWT 自动写入
     # 快照：nutrition × amount
     assert data["foods"]["aaaaaaaa"]["amount"] == 2
@@ -248,7 +251,8 @@ async def test_upsert_body_creates_when_no_record(meta_mock):
     assert result["action"] == "created"
     entry = entries[("body", result["id"])]
     assert entry["data"]["date"] == "2026-09-14"
-    assert "user_id" not in entry["data"]
+    assert entry["data"]["user_id"] == "42"  # meta schema required
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", entry["data"]["created_time"]) is not None
     assert entry["owner_user_id"] == 42
     assert entry["data"]["weight"] == 75
 

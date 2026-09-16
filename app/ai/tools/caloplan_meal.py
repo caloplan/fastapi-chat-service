@@ -27,6 +27,7 @@ from app.ai.tools._caloplan_common import (
     gen_entity_key,
     nutrition_from_data,
     simplify_meal_entry,
+    today_str,
 )
 from app.ai.tools.meta_client import MetaApiError, get_meta_client
 
@@ -109,6 +110,8 @@ async def create_meal(params: CreateMealParams) -> dict:
     entity_key = gen_entity_key()
     meal_data = {
         "id": entity_key,
+        "user_id": str(ctx.user.user_id),
+        "created_time": today_str(),
         "tips": params.tips,
         "type": params.type,
         "foods": snapshots,
