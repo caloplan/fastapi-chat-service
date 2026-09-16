@@ -149,6 +149,32 @@ def _extract_tool_results(messages: Any) -> list[ToolCallResult]:
     return [call for call in calls.values() if call.result is not None]
 
 
+def _extract_pending_tools(messages: Any) -> list[PendingToolCall]:
+    """从运行消息中提取**未执行**的 tool 调用（审批请求）。
+
+    审批 Tool 为 deferred 模式：消息中只有 ToolCallPart、无对应 ToolReturnPart。
+    正常执行的 tool（含执行失败转 ToolReturnPart(is_error)）均有配对，不会误判。
+    """
+    executed = {
+        part.tool_call_id
+        for msg in messages
+        for part in getattr(msg, "parts", [])
+        if isinstance(part, ToolReturnPart)
+    }
+    pending: list[PendingToolCall] = []
+    for msg in messages:
+        for part in getattr(msg, "parts", []):
+            if isinstance(part, ToolCallPart) and part.tool_call_id not in executed:
+                pending.append(
+                    PendingToolCall(
+                        tool_call_id=part.tool_call_id,
+                        name=part.tool_name,
+                        arguments=_normalize_arguments(part.args) or {},
+                    )
+                )
+    return pending
+
+
 async def run_chat(user: CurrentUser, body: ChatRequest, token: str | None = None) -> ChatResponse:
     """执行一次对话：正常回复，或命中需审批 Tool 时返回 taskid 审批请求。
 
@@ -210,6 +236,100 @@ async def run_chat(user: CurrentUser, body: ChatRequest, token: str | None = Non
             usage=_usage(result.usage),
             latency_ms=latency_ms,
             tool_calls=_extract_tool_results(result.all_messages()),
+        )
+
+
+def _sse(data: dict[str, Any]) -> str:
+    """SSE 数据帧（data: <json>\\n\\n）。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def run_chat_stream(user: CurrentUser, body: ChatRequest, token: str | None = None):
+    """SSE 流式对话（body.stream=true 时使用）。
+
+    事件流（data: <json> 帧）：
+    - {"type":"text","content":"<增量>"}：文本增量（可多次）；
+    - {"type":"approval","taskid":...,"pending_tools":[...]}：命中需审批 Tool
+      （审批 Tool 为 deferred 模式，流式过程不产出文本，无杂文本）；
+    - {"type":"done", ...ChatResponse 字段}：终态。正常回复 reply 为完整文本
+      （need_approval=false）；审批分支 reply 为空、need_approval=true 且携带
+      taskid/pending_tools，语义与 JSON 分支一致。
+    """
+    with bind_ai_context(token, user):
+        agent = get_ai_agent()
+        history = build_message_history(body.history)
+        conversation_id = body.conversation_id or uuid.uuid4().hex
+
+        start = time.perf_counter()
+        chunks: list[str] = []
+        try:
+            # run_stream 返回异步上下文管理器（__aenter__ 产出 StreamedRunResult），不可直接 await
+            # 注意：stream_text(delta=True) 才 yield 增量；默认 delta=False 会 yield 到当前点的完整前缀，
+            # 客户端按增量累加会重复拼接（同一条文本重复出现）。
+            async with agent.run_stream(body.message, message_history=history) as result:
+                async for chunk in result.stream_text(delta=True):
+                    chunks.append(chunk)
+                    yield _sse({"type": "text", "content": chunk})
+        except Exception as exc:
+            logger.error("AI 流式对话失败: %s", exc)
+            yield _sse({"type": "error", "detail": f"AI 调用失败: {exc}"})
+            return
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+
+        # StreamedRunResult 无 output 属性：审批检测改用消息配对
+        # （审批 Tool 为 deferred 模式，仅有 ToolCallPart 无 ToolReturnPart）
+        pending = _extract_pending_tools(result.all_messages())
+        if pending:
+            taskid = uuid.uuid4().hex
+            snapshot = {
+                "user_id": user.user_id,  # 创建者：审批请求必须由同一用户提交（越权 403）
+                "username": user.sub,  # 审计字段
+                "conversation_id": conversation_id,
+                "message_history": json.loads(ModelMessagesTypeAdapter.dump_json(result.all_messages())),
+                "calls": [p.model_dump() for p in pending],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            redis = await get_redis()
+            await redis.set(
+                _approval_key(taskid),
+                json.dumps(snapshot, ensure_ascii=False),
+                ex=settings.AI_APPROVAL_TTL_SECONDS,
+            )
+            logger.info(
+                "需审批 Tool 已暂存(stream): taskid=%s tools=%s ttl=%ss",
+                taskid,
+                [p.name for p in pending],
+                settings.AI_APPROVAL_TTL_SECONDS,
+            )
+            pending_dump = [p.model_dump() for p in pending]
+            yield _sse({"type": "approval", "taskid": taskid, "pending_tools": pending_dump})
+            yield _sse(
+                {
+                    "type": "done",
+                    "conversation_id": conversation_id,
+                    "reply": "",
+                    "model": settings.AI_MODEL_NAME,
+                    "usage": _usage(result.usage).model_dump(),
+                    "latency_ms": latency_ms,
+                    "tool_calls": [],
+                    "need_approval": True,
+                    "taskid": taskid,
+                    "pending_tools": pending_dump,
+                }
+            )
+            return
+
+        yield _sse(
+            {
+                "type": "done",
+                "conversation_id": conversation_id,
+                "reply": "".join(chunks),
+                "model": settings.AI_MODEL_NAME,
+                "usage": _usage(result.usage).model_dump(),
+                "latency_ms": latency_ms,
+                "tool_calls": [t.model_dump() for t in _extract_tool_results(result.all_messages())],
+                "need_approval": False,
+            }
         )
 
 
@@ -280,4 +400,4 @@ async def resolve_approval(user: CurrentUser, body: ApprovalDecisionRequest, tok
         )
 
 
-__all__ = ["build_message_history", "resolve_approval", "run_chat"]
+__all__ = ["build_message_history", "resolve_approval", "run_chat", "run_chat_stream"]

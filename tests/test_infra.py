@@ -4,6 +4,7 @@
 同时验证服务名白名单在基础设施端点同样生效。
 """
 
+import json
 from types import SimpleNamespace
 
 from app.core.redis import get_redis
@@ -23,11 +24,43 @@ class _FakeRedis:
         return True
 
 
+class _StreamContext:
+    """模拟 pydantic-ai run_stream 的返回值：异步上下文管理器（不可直接 await）。"""
+
+    def __init__(self, result: "_StreamResult") -> None:
+        self._result = result
+
+    async def __aenter__(self) -> "_StreamResult":
+        return self._result
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+class _StreamResult:
+    """模拟 pydantic-ai StreamedRunResult（__aenter__ 产物）。"""
+
+    def __init__(self, output: object, chunks: list[str], messages: list | None = None) -> None:
+        self.output = output
+        self._chunks = chunks
+        self._messages = messages or []
+        self.usage = SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15)
+
+    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1):
+        # 真实 pydantic-ai：delta=True 时 yield 增量；mock 直接按增量块产出
+        for c in self._chunks:
+            yield c
+
+    def all_messages(self) -> list:
+        return self._messages
+
+
 class _FakeAgent:
     """模拟 PydanticAI Agent（run 返回带 output/usage/all_messages 的结果）。"""
 
-    def __init__(self, output: str = "你好，我是 Chat Service 助手。") -> None:
+    def __init__(self, output: str = "你好，我是 Chat Service 助手。", chunks: list[str] | None = None) -> None:
         self._output = output
+        self._chunks = chunks if chunks is not None else ([output] if output else [])
 
     @staticmethod
     def _usage() -> SimpleNamespace:
@@ -40,10 +73,62 @@ class _FakeAgent:
             all_messages=lambda: [],
         )
 
+    def run_stream(self, message: str, **kwargs: object) -> _StreamContext:
+        # pydantic-ai 的 run_stream 为同步方法，返回 async context manager（不可直接 await）
+        return _StreamContext(_StreamResult(self._output, self._chunks))
+
+
+class _StreamApprovalAgent:
+    """模拟 Agent：run_stream 无文本产出，output 为 DeferredToolRequests（命中审批）。"""
+
+    @staticmethod
+    def _usage() -> SimpleNamespace:
+        return SimpleNamespace(input_tokens=20, output_tokens=0, total_tokens=20)
+
+    def run_stream(self, message: str, **kwargs: object) -> _StreamContext:
+        from pydantic_ai import DeferredToolRequests
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+        dtr = DeferredToolRequests(
+            calls=[],
+            approvals=[
+                ToolCallPart(
+                    tool_name="upsert_my_body",
+                    args={"date": "2026-09-16", "weight": 75},
+                    tool_call_id="call-1",
+                )
+            ],
+        )
+        # 审批 Tool 为 deferred 模式：消息中仅有 ToolCallPart（无 ToolReturnPart 配对）
+        messages = [
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="upsert_my_body",
+                        args={"date": "2026-09-16", "weight": 75},
+                        tool_call_id="call-1",
+                    )
+                ]
+            )
+        ]
+        return _StreamContext(_StreamResult(dtr, [], messages=messages))
+
 
 def _auth_headers(**overrides: object) -> dict[str, str]:
     token = create_test_token(**overrides)
     return {"Authorization": f"Bearer {token}"}
+
+
+def _sse_events(text: str) -> list[dict]:
+    """解析 SSE 响应体（data: <json> 帧）为事件列表。"""
+    events = []
+    for frame in text.strip().split("\n\n"):
+        frame = frame.strip()
+        if not frame:
+            continue
+        assert frame.startswith("data: "), f"非法 SSE 帧: {frame!r}"
+        events.append(json.loads(frame[6:]))
+    return events
 
 
 # ── Redis 演示端点 ──────────────────────────────────────────
@@ -111,6 +196,89 @@ async def test_ai_chat_invalid_body(client):
         json={},
     )
     assert resp.status_code == 422
+
+
+# ── SSE 流式对话（stream=true） ─────────────────────────────
+
+async def test_ai_chat_stream_ok(client, monkeypatch):
+    """stream=true 无审批：SSE 事件 = text 增量 × N + done（完整 reply）。"""
+    monkeypatch.setattr(
+        "app.ai.service.get_ai_agent",
+        lambda: _FakeAgent(output="流式回复", chunks=["流式", "回复"]),
+    )
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={"message": "你好", "stream": True},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    events = _sse_events(resp.text)
+    assert [e for e in events if e["type"] == "text"] == [
+        {"type": "text", "content": "流式"},
+        {"type": "text", "content": "回复"},
+    ]
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["reply"] == "流式回复"
+    assert done["need_approval"] is False
+    assert done["model"] == "deepseek-chat"
+    assert done["usage"]["total_tokens"] == 15
+
+
+async def test_ai_chat_stream_approval(client, monkeypatch):
+    """stream=true 命中需审批 Tool：approval 事件 + done(need_approval=true)，无杂文本。"""
+    monkeypatch.setattr("app.ai.service.get_ai_agent", lambda: _StreamApprovalAgent())
+
+    class _StreamFakeRedis:
+        def __init__(self) -> None:
+            self.sets: list[tuple] = []
+
+        async def set(self, key: str, value: str, ex: int | None = None) -> None:
+            self.sets.append((key, value, ex))
+
+    fr = _StreamFakeRedis()
+
+    async def _fake_get_redis():
+        return fr
+
+    monkeypatch.setattr("app.ai.service.get_redis", _fake_get_redis)
+
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={"message": "帮我记录今天体重 75kg", "stream": True},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp.text)
+    # 审批 Tool 为 deferred 模式：无任何 text 事件
+    assert [e["type"] for e in events] == ["approval", "done"]
+    approval = events[0]
+    assert approval["pending_tools"][0]["name"] == "upsert_my_body"
+    assert approval["pending_tools"][0]["arguments"] == {"date": "2026-09-16", "weight": 75}
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["need_approval"] is True
+    assert done["reply"] == ""
+    assert done["taskid"] == approval["taskid"]
+    assert done["pending_tools"] == approval["pending_tools"]
+    # 快照已写入 Redis（TTL=AI_APPROVAL_TTL_SECONDS）
+    assert len(fr.sets) == 1
+    assert "approval:" in fr.sets[0][0]
+    assert fr.sets[0][2] is not None
+
+
+async def test_ai_chat_stream_default_json(client, monkeypatch):
+    """stream 缺省（false）：仍返回普通 JSON，而非 SSE。"""
+    monkeypatch.setattr("app.ai.service.get_ai_agent", lambda: _FakeAgent(output="普通回复"))
+    resp = await client.post(
+        "/api/v1/ai/chat",
+        headers=_auth_headers(service_name="default"),
+        json={"message": "你好"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.json()["reply"] == "普通回复"
 
 
 def test_extract_tool_results_str_args_regression():

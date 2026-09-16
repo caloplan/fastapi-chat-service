@@ -47,7 +47,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 9095
 | GET | `/health` | 健康检查 | 否 |
 | GET | `/` | 服务信息 | 否 |
 | GET | `/api/v1/redis/ping` | Redis 连通性 | Bearer JWT |
-| POST | `/api/v1/ai/chat` | AI 对话（可触发审批） | Bearer JWT |
+| POST | `/api/v1/ai/chat` | AI 对话（可触发审批；`stream=true` 时 SSE 流式） | Bearer JWT |
 | POST | `/api/v1/ai/approval` | 审批决定（批准/拒绝 taskid） | Bearer JWT |
 
 ### POST /api/v1/ai/chat
@@ -102,6 +102,35 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 9095
 
 批准则执行 tool 并回传 `tool_results` 明细；拒绝则不执行、模型照常给最终回复。
 **审批约束**：taskid 与发起者 user_id 绑定（越权 403）；TTL 5min 过期作废（410）；Lua 原子消费防并发重复执行。
+
+### SSE 流式（stream=true）
+
+请求加 `"stream": true`（默认 `false`）→ 响应切换为 `text/event-stream`，逐帧推送
+`data: <json>\n\n` 事件，客户端按 `type` 区分：
+
+```text
+data: {"type":"text","content":"这是第一段增量"}
+data: {"type":"text","content":"这是第二段增量"}
+data: {"type":"done","conversation_id":"…","reply":"这是第一段增量这是第二段增量",
+       "model":"deepseek-chat","usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120},
+       "latency_ms":850.0,"tool_calls":[],"need_approval":false}
+```
+
+- **`text`**：文本增量（可多次，客户端累积展示即打字机效果）；`done`：终态事件，结构与
+  JSON 分支的 `ChatResponse` 完全一致，`reply` 为完整文本；
+- **命中需审批 Tool 时**：因审批 Tool 为 deferred 模式，流式过程**不产出任何 text 事件**，
+  直接推 `approval` 事件 + `done`（`need_approval=true`，含 `taskid`/`pending_tools`，语义与 JSON 分支相同），
+  客户端据 `done.need_approval` 显示审批卡即可；
+- **出错时**：推 `{"type":"error","detail":"…"}` 后结束流；
+- 多模态历史（history 带 image_url）与 `stream=true` 可同时使用（前提同为 `deepseek-flash`）。
+
+curl 示例：
+
+```bash
+curl -N -X POST http://localhost:9095/api/v1/ai/chat \
+  -H "Authorization: Bearer <JWT>" -H "Content-Type: application/json" \
+  -d '{"message":"讲个冷笑话","stream":true}'
+```
 
 ### 多模态历史（history 携带图片）
 
@@ -232,13 +261,15 @@ python scripts/init_meta_types.py --token <superuser-jwt> --base-url http://120.
 ## 运行测试
 
 ```bash
-pytest tests -v    # 当前 63 passed
+pytest tests -v    # 当前 66 passed
 ```
 
 覆盖：认证（令牌解析/白名单/权限三重 AND）；Redis/AI 端点（mock）；Tool 注册与配置过滤；
 审批流全链路（触发→暂存→批准/拒绝→消费，过期 410/越权 403，续跑 JWT 透传）；caloplan tools
 （meta 内存 mock：读写、meal 快照与合计营养、upsert 语义、**owner 隔离**、entity_key 注入）；
-**多模态历史**（content 数组含 image_url → TextContent/ImageUrl parts，端到端 422→200）。
+**多模态历史**（content 数组含 image_url → TextContent/ImageUrl parts，端到端 422→200）；
+**SSE 流式**（stream=true：text 增量 + done 终态；审批分支 approval 事件 + done(need_approval=true)、
+快照入库；stream 缺省仍为 JSON）。
 
 ## 项目结构
 
@@ -254,7 +285,7 @@ fastapi-chat-service/
 │   ├── ai/
 │   │   ├── agent.py                     # PydanticAI Agent 构建（DeepSeek/OpenAI 兼容 + 审批输出类型切换）
 │   │   ├── context.py                   # AI 请求上下文（JWT + 用户身份 contextvar 绑定）
-│   │   ├── service.py                   # AI 编排：run_chat / resolve_approval（taskid 审批流；多模态历史解析）
+│   │   ├── service.py                   # AI 编排：run_chat / run_chat_stream（SSE 流式）/ resolve_approval（taskid 审批流；多模态历史解析）
 │   │   └── tools/
 │   │       ├── __init__.py              # register_tool / build_tools / AI_ENABLED_TOOLS 过滤
 │   │       ├── meta_client.py           # meta-service HTTP 客户端（JWT 透传 + 错误映射）

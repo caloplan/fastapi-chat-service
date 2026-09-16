@@ -58,6 +58,7 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = Field(None, max_length=64)  # 客户端生成，仅日志关联/幂等用
     history: list[ChatMessage] = Field(default_factory=list, max_length=40)
     params: ModelParams = Field(default_factory=ModelParams)
+    stream: bool = False  # true 时以 SSE 流式返回（text 增量 + done 终态；审批分支同 JSON 语义）
 
 
 class ToolCallResult(BaseModel):

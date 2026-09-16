@@ -9,8 +9,9 @@ from typing import Annotated
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 
-from app.ai.service import resolve_approval, run_chat
+from app.ai.service import resolve_approval, run_chat, run_chat_stream
 from app.core.dependencies import get_current_user
 from app.core.redis import get_redis
 from app.schemas.ai import ApprovalDecisionRequest, ApprovalDecisionResponse, ChatRequest, ChatResponse
@@ -36,13 +37,19 @@ async def redis_ping(
     return {"status": "ok", "latency_ms": elapsed_ms}
 
 
-@router.post("/ai/chat", response_model=ChatResponse, summary="AI 对话（可触发需审批 Tool）", description="需要认证；正常回复或返回 need_approval=true + taskid 审批请求。")
+@router.post("/ai/chat", response_model=ChatResponse, summary="AI 对话（可触发需审批 Tool / 可选 SSE 流式）", description="需要认证；stream=false 返回正常回复或 need_approval=true + taskid 审批请求；stream=true 以 SSE 流式返回（text 增量 + done 终态，审批分支发 approval 事件）。")
 async def ai_chat(
     request: Request,
     body: ChatRequest,
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
-) -> ChatResponse:
+):
     token = _extract_bearer(request)
+    if body.stream:
+        return StreamingResponse(
+            run_chat_stream(current_user, body, token),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     return await run_chat(current_user, body, token)
 
 
