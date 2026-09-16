@@ -8,12 +8,14 @@
 - taskid 与发起者 user_id 绑定，防止越权执行。
 """
 
+import base64
 import json
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from fastapi import HTTPException, status
 from pydantic_ai import DeferredToolRequests, DeferredToolResults, ModelMessagesTypeAdapter
 from pydantic_ai.messages import (
@@ -50,11 +52,36 @@ from app.utils.logger import get_logger
 logger = get_logger("ai_service")
 
 
+def _resolve_image_data_url(url: str) -> str:
+    """http(s) 图片 URL → base64 data URL；data URL 原样透传。
+
+    背景：图片上传后返回的 URL 公网可访问、文件合法（已验证 JPEG/PNG 等），
+    但 DeepSeek 服务器侧下载 URL 时可能因网络/策略拿不到原图，报
+    "unsupported image"。改为由本服务下载后以内联 data URL 发送，模型直接
+    解析字节，彻底绕开 URL 下载环节。下载失败时回退原 URL（保留模型侧重试）。
+    """
+    if url.startswith("data:"):
+        return url
+    try:
+        resp = httpx.get(url, timeout=30.0, follow_redirects=True)
+        resp.raise_for_status()
+        media = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+        if media not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+            media = "image/jpeg"
+        data = base64.b64encode(resp.content).decode("ascii")
+        logger.info("图片 URL 已转 data URL: %s -> %s bytes", url[:80], len(resp.content))
+        return f"data:{media};base64,{data}"
+    except Exception as exc:
+        logger.warning("图片 URL 下载失败，回退原 URL: %s err=%s", url[:80], exc)
+        return url
+
+
 def _content_blocks_to_parts(content: str | list[ContentBlock]) -> list[TextContent | ImageUrl]:
     """OpenAI/DeepSeek 风格 content（str 或内容块数组）→ pydantic-ai content parts。
 
-    文本块 → TextContent；image_url 块 → ImageUrl（data URL / http(s) URL 均可），
-    序列化后与 DeepSeek vision 的 content 数组格式一致。
+    文本块 → TextContent；image_url 块 → ImageUrl（http(s) URL 自动转 base64
+    data URL 内联发送，data URL 原样透传），序列化后与 DeepSeek vision 的
+    content 数组格式一致。
     """
     if isinstance(content, str):
         return [TextContent(content)] if content else []
@@ -65,7 +92,7 @@ def _content_blocks_to_parts(content: str | list[ContentBlock]) -> list[TextCont
         elif block.type == "image_url" and block.image_url:
             url = block.image_url.get("url") if isinstance(block.image_url, dict) else block.image_url
             if url:
-                parts.append(ImageUrl(url=url))
+                parts.append(ImageUrl(url=_resolve_image_data_url(url)))
     return parts
 
 
