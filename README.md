@@ -186,7 +186,7 @@ curl -N -X POST http://localhost:9095/api/v1/ai/chat \
 |---|---|---|
 | `get_current_time` | 读（免审批） | 当前日期时间 |
 | `list_my_food` | 读（免审批） | 我的食物库（供 create_meal 引用 food_id） |
-| `list_my_meal` | 读（免审批） | 我的膳食列表 |
+| `list_my_meal` | 读（免审批） | 我的膳食列表（可按 `created_time` 按日过滤，YYYY-MM-DD，不传返回全部） |
 | `get_my_body_by_date` | 读（免审批） | 指定日期身体指标 |
 | `get_my_nutrition_by_date` | 读（免审批） | 指定日期营养目标 |
 | `create_food` | 写（需审批） | 添加食物（entity_key=uuid4 短码；owner_user_id 由 meta 从 JWT 自动注入） |
@@ -203,33 +203,28 @@ curl -N -X POST http://localhost:9095/api/v1/ai/chat \
 - **审批续跑**：批准执行的 tool 同样绑定当前请求 JWT，透传 meta 无感知；
 - **不暴露给模型**：`service_name` / entity_key 由服务端生成，模型不可见、不可改。
 
-### 数据模型：data 只存业务字段，user_id 是 entry 元数据
+### 数据模型：data 存业务字段（含 user_id / created_time），归属与版本在 entry 元数据
 
 meta 的 entry 分两层：
 
-- **data（业务字段）**：`body={date,age,height,weight}`、`nutrition={date,carbon,protein,fat,salt,calorie}`、`food={id,name,image,unit,nutrition}`（`id` 为业务 food_id）、`meal={id,tips,type,foods,nutrition}`（`id` 为业务 meal_id）；
-- **entry 元数据（MetaSDK）**：`entity_key` / `owner_user_id`（= 创建时 JWT 的 user_id，meta 自动写入）/ `created_at` / `updated_at` / `version` —— **不进入 data**，chat 侧不再往 data 塞 `user_id` / `created_time`。
+- **data（业务字段，snake_case，对齐 caloplan-core 落库契约）**：`food={id,user_id,name,image,unit,nutrition,created_time}`、`meal={id,user_id,tips,type,foods,nutrition,created_time}`、`body={date,user_id,age,height,weight,created_time}`、`nutrition={date,user_id,carbon,protein,fat,salt,calorie,created_time}`；`user_id` 为当前用户（冗余兜底，meta 已按 owner 隔离），`created_time` 统一存 `yyyy-mm-dd`（供按日过滤查询）；
+- **entry 元数据（MetaSDK，由 meta 管理、不进 data）**：`entity_key` / `owner_user_id`（= 创建时 JWT 的 user_id，meta 自动写入）/ `service_name` / `created_at` / `updated_at` / `version`。
 
-**用户隔离**：meta 查询仅按 `service_name` 隔离（同 service 多用户数据互相可见、查询不支持按 owner 过滤），
-因此 chat 侧在查询响应后按 `entry.owner_user_id` **本地过滤**当前用户（`_caloplan_common.filter_by_owner`）；
+**用户隔离**：meta 在查询/批量查询时按 `service_name` + `owner_user_id` **双重隔离**（MetaScope：普通身份强制自身 service 且自身 owner，越权数据返回 `null`/不可见），
+因此 chat 侧查询响应后按 `entry.owner_user_id` **本地过滤**当前用户（`_caloplan_common.filter_by_owner`）属防御性冗余；
 `create_meal` 批量引用 food 同样按 owner 过滤，他人的 food 视为未找到并报错。
 
 ### 坑：data 业务字段必须在 type schema 中（否则字段被丢弃）
 
 meta 创建/更新 entry 时按 type schema 动态校验，**未在 schema 中定义的字段会被丢弃**（Pydantic 默认忽略额外字段）。
-若类型的 schema 缺少 data 业务字段（尤其 `date`），会导致：创建时该字段被丢 → 按 `date` 过滤查询永远查不到
+若类型的 schema 缺少 data 业务字段（尤其 `date` / `created_time` / `user_id`），会导致：创建时该字段被丢 → 按该字段过滤查询永远查不到
 （list 返回空、upsert 只 create 不 update）——**即使 Agent 调用查询 tool 也查不到**。
 
-初始化/补齐 schema（meta 类型管理仅 superuser）：
+类型 schema 由 meta 管理后台（server-meta-admin）维护（类型管理仅 superuser）：
 
-```bash
-python scripts/init_meta_types.py --token <superuser-jwt> --base-url http://120.24.172.141:51093 --service caloplan
-```
-
-- 脚本按 chat 落库 data **业务字段**补齐四个类型的 schema（外层字段精确，嵌套 unit/nutrition/foods 用宽松 object/dict 防嵌套字段被丢）；**`user_id` / `created_time` 不在补齐范围内**（entry 元数据由 meta 管理）；
-- `--service` 必须与业务名一致（**caloplan**，默认 `default` 会建错）；
-- 已存在的 type 采用「仅补充缺失字段」合并（meta 有实体数据时拒绝移除/改类型）；字段类型与落库约定冲突会告警；
-- **已有脏数据**：修复 schema 前创建且业务字段已被丢弃的记录无法恢复（查询同样查不到），如为测试数据可忽略或清理。
+- 四个类型（food / meal / body / nutrition）的 schema 必须包含 chat 落库 data 的**全部业务字段**（外层字段精确，嵌套 unit / nutrition / foods 用宽松 object / dict 防嵌套字段被丢）；
+- 新增 data 业务字段时需同步在后台补充到对应类型 schema（已有实体数据时 meta 仅允许新增字段，拒绝移除/改类型）；
+- **已有脏数据**：补齐 schema 前创建且业务字段已被丢弃的记录无法恢复（查询同样查不到），如为测试数据可忽略或清理。
 
 ## 需审批 Tool 的 taskid 审批流
 
@@ -316,8 +311,6 @@ fastapi-chat-service/
 │   │   └── infra.py                     # 基础设施路由（Redis ping / AI chat / AI approval）
 │   ├── proxy/log_proxy.py               # 日志代理（后续 Repository 层使用）
 │   └── utils/logger.py                  # 轮转日志
-├── scripts/
-│   └── init_meta_types.py               # meta 类型 schema 补齐脚本（--service caloplan）
 ├── demo/index.html                      # Demo 页面（登录/审批/自动续期）
 ├── tests/                               # conftest（RSA/JWKS mock）+ auth/infra/tools/caloplan_tools/approval
 ├── .env.example
@@ -344,8 +337,9 @@ docker-compose up -d --build
 
 1. **新增 Tool**：`app/ai/tools/` 下新建模块，`@register_tool(name, description, requires_approval)` 装饰 async 函数；
    需要用户确认的写操作加 `requires_approval=True`；读操作免审批；`AI_ENABLED_TOOLS` 控制启用；
-2. **写 caloplan 数据 tool**：data 只放业务字段（user_id/created_time 交给 meta 元数据）；
-   查询返回后必须用 `filter_by_owner(items, user_id)` 过滤当前用户；新 data 字段需同步 `scripts/init_meta_types.py` 与 meta schema；
+2. **写 caloplan 数据 tool**：data 按 caloplan-core 落库契约放业务字段（snake_case，含 `user_id` / `created_time`，`created_time` 存 `yyyy-mm-dd`）；
+   查询返回后用 `filter_by_owner(items, user_id)` 过滤当前用户（meta 已按 owner 隔离，此为防御性冗余）；
+   新增 data 字段需同步到 meta 类型 schema（管理后台维护），否则字段会被静默丢弃；
 3. **新业务路由**：`app/routes/` 下新建并挂载到 `main.py`，写入时从 `CurrentUser` 提取 `user_id` / `service_name` 做归属判定（403）；
 4. **Redis 使用**：注入 `get_redis`，Key 统一加 `REDIS_PREFIX` 前缀；
 5. **pydantic-ai 2.43 注意**：模型类为 `OpenAIChatModel`（旧 `OpenAIModel` 已移除）；`result.usage` 是属性不是方法；

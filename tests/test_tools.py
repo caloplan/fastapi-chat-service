@@ -15,6 +15,7 @@ _ALL_TOOLS = {
     "create_food",
     "list_my_food",
     "create_meal",
+    "delete_meal",
     "list_my_meal",
     "upsert_my_body",
     "get_my_body_by_date",
@@ -23,7 +24,7 @@ _ALL_TOOLS = {
 }
 
 # 需审批（requires_approval=True）的写 tool
-_APPROVAL_TOOLS = {"create_food", "create_meal", "upsert_my_body", "upsert_my_nutrition"}
+_APPROVAL_TOOLS = {"create_food", "create_meal", "delete_meal", "upsert_my_body", "upsert_my_nutrition"}
 
 
 def _set_enabled(value: list[str]):

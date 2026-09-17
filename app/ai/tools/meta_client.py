@@ -187,6 +187,13 @@ class MetaClient:
             json_body={"type_name": type_name, "keys": keys},
         )
 
+    async def delete_entry(self, type_name: str, entity_key: str) -> None:
+        """软删除实体（204 无返回）。"""
+        await self._request(
+            "DELETE",
+            f"/api/v1/entries/{type_name}/{entity_key}",
+        )
+
 
 _client: MetaClient | None = None
 

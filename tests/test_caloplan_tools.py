@@ -16,7 +16,7 @@ import pytest
 from app.ai.context import bind_ai_context
 from app.ai.tools.caloplan_body import UpsertBodyParams, get_my_body_by_date, upsert_my_body
 from app.ai.tools.caloplan_food import CreateFoodParams, NutritionValues, create_food, list_my_food
-from app.ai.tools.caloplan_meal import CreateMealParams, MealFoodItem, create_meal
+from app.ai.tools.caloplan_meal import CreateMealParams, DeleteMealParams, MealFoodItem, create_meal, delete_meal
 from app.ai.tools.caloplan_nutrition import UpsertNutritionParams, get_my_nutrition_by_date, upsert_my_nutrition
 from app.ai.tools.meta_client import MetaClient
 from app.schemas.auth import CurrentUser
@@ -84,6 +84,20 @@ def make_meta_server():
             entry = {**old, "data": merged, "version": old["version"] + 1}
             entries[(type_name, entity_key)] = entry
             return httpx.Response(200, json=entry)
+
+        if method == "GET" and path.startswith("/api/v1/entries/"):
+            _v, _api, _entries, type_name, entity_key = path.strip("/").split("/")
+            entry = entries.get((type_name, entity_key))
+            if entry is None:
+                return httpx.Response(404, json={"detail": "not found"})
+            return httpx.Response(200, json=entry)
+
+        if method == "DELETE" and path.startswith("/api/v1/entries/"):
+            _v, _api, _entries, type_name, entity_key = path.strip("/").split("/")
+            if (type_name, entity_key) not in entries:
+                return httpx.Response(404, json={"detail": "not found"})
+            del entries[(type_name, entity_key)]
+            return httpx.Response(204)
 
         return httpx.Response(404, json={"detail": "not found"})
 
@@ -220,6 +234,7 @@ async def test_create_meal_success(meta_mock):
     assert re.match(r"^\d{4}-\d{2}-\d{2}$", data["created_time"]) is not None
     assert meal["owner_user_id"] == 42  # meta 从 JWT 自动写入
     # 快照：nutrition × amount
+    assert data["foods"]["aaaaaaaa"]["food_id"] == "aaaaaaaa"  # meta schema snake_case
     assert data["foods"]["aaaaaaaa"]["amount"] == 2
     assert data["foods"]["aaaaaaaa"]["nutrition"]["energy"] == {"unit": "kcal", "value": 100}  # 50 × 2
     assert data["foods"]["aaaaaaaa"]["name"] == "苹果"
@@ -239,6 +254,48 @@ async def test_create_meal_missing_food_reports_error(meta_mock):
     assert result["ok"] is False
     assert "未找到食物" in result["error"]
     assert "deadbeef" in result["error"]
+
+
+async def test_delete_meal_success(meta_mock):
+    entries, calls = meta_mock
+    entries[("meal", "meal1234")] = _entry(
+        "meal",
+        "meal1234",
+        {"id": "meal1234", "user_id": "42", "type": "breakfast", "tips": "x", "foods": {}, "nutrition": {}},
+    )
+    with bind_ai_context("t", TEST_USER):
+        result = await delete_meal(DeleteMealParams(meal_id="meal1234"))
+    assert result["ok"] is True
+    assert result["id"] == "meal1234"
+    assert ("meal", "meal1234") not in entries  # 软删除后从存储移除
+    # 最后一次请求是 DELETE
+    assert calls[-1].method == "DELETE"
+    assert "/api/v1/entries/meal/meal1234" in calls[-1].url.path
+
+
+async def test_delete_meal_not_found(meta_mock):
+    _entries, _calls = meta_mock
+    with bind_ai_context("t", TEST_USER):
+        result = await delete_meal(DeleteMealParams(meal_id="nonexist"))
+    assert result["ok"] is False
+    assert "未找到膳食" in result["error"]
+
+
+async def test_delete_meal_cross_owner_forbidden(meta_mock):
+    entries, _calls = meta_mock
+    # 属于另一个用户（owner_user_id=99）的 meal
+    entry = _entry(
+        "meal",
+        "meal9999",
+        {"id": "meal9999", "user_id": "99", "type": "dinner", "tips": "", "foods": {}, "nutrition": {}},
+    )
+    entry["owner_user_id"] = 99
+    entries[("meal", "meal9999")] = entry
+    with bind_ai_context("t", TEST_USER):
+        result = await delete_meal(DeleteMealParams(meal_id="meal9999"))
+    assert result["ok"] is False
+    assert "无权删除" in result["error"]
+    assert ("meal", "meal9999") in entries  # 未被删除
 
 
 # ── upsert_my_body（每日一条，可无限更新）────────────────────
