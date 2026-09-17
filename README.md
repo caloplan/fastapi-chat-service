@@ -6,6 +6,7 @@ AI 模型接入 **DeepSeek**（官方端点），内置 **Tool 注册/配置基�
 数据读写对接 **meta-service**（caloplan 数据域：food / meal / body / nutrition）。
 
 > 本服务定位为 **caloplan 专属**，不做通用微服务框架。扩展业务前先读本 README 的「约定与坑」章节。
+
 ## 相关项目（CaloPlan 全家桶）
 
 CaloPlan 全栈项目统一托管在 GitHub Organization [caloplan](https://github.com/caloplan)：
