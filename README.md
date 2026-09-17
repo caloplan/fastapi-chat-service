@@ -6,6 +6,23 @@ AI 模型接入 **DeepSeek**（官方端点），内置 **Tool 注册/配置基�
 数据读写对接 **meta-service**（caloplan 数据域：food / meal / body / nutrition）。
 
 > 本服务定位为 **caloplan 专属**，不做通用微服务框架。扩展业务前先读本 README 的「约定与坑」章节。
+## 相关项目（CaloPlan 全家桶）
+
+CaloPlan 全栈项目统一托管在 GitHub Organization [caloplan](https://github.com/caloplan)：
+
+| 类型 | 项目 | 与本项目关系 |
+| --- | --- | --- |
+| 前端 | [coloplan-v2](https://github.com/caloplan/coloplan-v2) | 客户端（AI 页） |
+| SDK | [caloplan-core](https://github.com/caloplan/caloplan-core) | 业务核心（落库契约来源） |
+| SDK | [caloplan-user](https://github.com/caloplan/caloplan-user) | 用户模块（兄弟 SDK） |
+| SDK | [caloplan-chat](https://github.com/caloplan/caloplan-chat) | 前端 AI 对话 SDK（对接本服务） |
+| SDK | [caloplan-cache](https://github.com/caloplan/caloplan-cache) | 通用缓存（兄弟模块） |
+| 服务（本仓库） | [fastapi-chat-service](https://github.com/caloplan/fastapi-chat-service) | AI 对话微服务 |
+| 服务 | [fastapi-file-service](https://github.com/caloplan/fastapi-file-service) | 图片上传微服务（兄弟服务） |
+| 服务 | [mservice-fastapi-user](https://github.com/caloplan/mservice-fastapi-user) | 认证 / 用户微服务（JWT 签发方） |
+| 服务 | [mservice-fastapi-metastorage](https://github.com/caloplan/mservice-fastapi-metastorage) | 元数据微服务（AI 工具数据落库对端） |
+
+本服务认证消费 `mservice-fastapi-user` 签发的 RS256 JWT，数据读写对接 `mservice-fastapi-metastorage`；前端经 `caloplan-chat` SDK 接入。
 
 ## 快速开始
 
